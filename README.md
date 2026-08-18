@@ -11,54 +11,48 @@ queryable via LogQL, and posted to Discord in real time.
 ## Architecture
 
 ```
-                        attacker (internet)
-                                │
-                                ▼
-                     Tailscale Funnel (public HTTPS)
-                                │
-╔═══════════════════════════════▼══════════════════════════╗
-║ cluster: timbernetes                                        ║
-║                                                              ║
-║   ┌────────────────────────────────────────────────────┐  ║
-║   │ pod: floci-deception  (one pod, one network         │  ║
-║   │                        namespace, shared by all 4)  │  ║
-║   │                                                       │  ║
-║   │  ┌────────────────┐                                  │  ║
-║   │  │ decoy-app (Ray) │  the bait — no auth, runs a     │  ║
-║   │  │                 │  shell command as a "job", has  │  ║
-║   │  │                 │  the canary AWS key in its env  │  ║
-║   │  └────────┬─────────┘                                 │  ║
-║   │           │ boto3 call, no --endpoint-url             │  ║
-║   │           ▼                                           │  ║
-║   │  ┌────────────────┐                                  │  ║
-║   │  │ envoy-sidecar   │  iptables redirects tcp/443      │  ║
-║   │  │  + Lua filter   │  here; decrypts TLS, works out   │  ║
-║   │  │                 │  the AWS action, builds a        │  ║
-║   │  │                 │  CloudTrail-shaped log line       │  ║
-║   │  └────────┬─────────┘                                 │  ║
-║   │           ▼                                           │  ║
-║   │  ┌────────────────┐                                  │  ║
-║   │  │ floci           │  fake AWS — answers the call     │  ║
-║   │  └─────────────────┘                                  │  ║
-║   │  ┌────────────────┐                                  │  ║
-║   │  │ promtail        │  ships the log out of the pod    │  ║
-║   │  └────────┬─────────┘                                 │  ║
-║   └───────────┼─────────────────────────────────────────┘  ║
-║               │  everything else blocked — default-deny    ║
-║               │  egress, only this path + DNS allowed      ║
-╚═══════════════▼══════════════════════════════════════════╝
-                                │
-                                ▼
-                     ┌────────────────────┐
-                     │ Loki                │  log_type=cloudtrail
-                     └──────────┬───────────┘
-                                ▼
-                     ┌────────────────────┐
-                     │ discord-alert-tailer│  batches bursts,
-                     │                      │  colors by severity
-                     └──────────┬───────────┘
-                                ▼
-                          Discord channel
+                    attacker (internet)
+                            │
+                            ▼
+                 Tailscale Funnel (public HTTPS)
+                            │
+╔════════════════════════════════════════════════════════════╗
+║ cluster: timbernetes                                       ║
+║                                                            ║
+║ pod: floci-deception (one pod, one netns, all 4            ║
+║ containers below share it)                                 ║
+║                                                            ║
+║   decoy-app (Ray)                                          ║
+║     no auth, runs a shell command as a "job",              ║
+║     has the canary AWS key in its environment              ║
+║         │  boto3 call, no --endpoint-url                   ║
+║         ▼                                                  ║
+║   envoy-sidecar + Lua filter                               ║
+║     iptables redirects tcp/443 here; decrypts              ║
+║     TLS, works out the AWS action, builds a                ║
+║     CloudTrail-shaped log line                             ║
+║         │                                                  ║
+║         ▼                                                  ║
+║   floci                                                    ║
+║     fake AWS — answers the call                            ║
+║                                                            ║
+║   promtail                                                 ║
+║     ships the log out of the pod                           ║
+║                                                            ║
+║   (everything else blocked — default-deny egress,          ║
+║    only this path + DNS allowed out)                       ║
+╚════════════════════════════════════════════════════════════╝
+                            │
+                            ▼
+                          Loki
+                    (log_type=cloudtrail)
+                            │
+                            ▼
+                  discord-alert-tailer
+            batches bursts, colors by severity
+                            │
+                            ▼
+                      Discord channel
 ```
 
 ## The bait
