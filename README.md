@@ -49,7 +49,7 @@ queryable via LogQL, and posted to Discord in real time.
                             │
                             ▼
                   discord-alert-tailer
-            batches bursts, colors by severity
+         one embed per event, colors by severity
                             │
                             ▼
                       Discord channel
@@ -109,9 +109,9 @@ kubectl config use-context <management-cluster-context>
 kubectl apply -f manifests/alerting/
 ```
 
-Alerts batch over a 3s window (bursts collapse into one summary instead
-of flooding the channel) and color by severity (red = privesc/
-persistence/destructive, orange = mutation, grey = recon).
+One Discord embed per event, posted as it happens, colored by severity
+(red = privesc/persistence/destructive, orange = mutation, grey =
+recon). A small `requestID` dedup guard drops exact repeats.
 
 ## Public exposure (Tailscale Funnel)
 
@@ -166,3 +166,13 @@ Shipped to the cluster's existing Loki, tagged `log_type=cloudtrail`:
 ```logql
 {log_type="cloudtrail"} | json | eventName="CreateUser"
 ```
+
+## Fake instance metadata (IMDS)
+
+A second Envoy listener binds `169.254.169.254:80` inside the pod and
+answers the EC2 instance metadata endpoints directly (Lua `respond()`,
+no upstream) — same canary key as `iam/security-credentials/<role>`.
+Automated cloud-recon tools (Pacu, ScoutSuite, linPEAS) probe IMDS on
+their own regardless of what's already visible in the environment;
+this gives them the credential too. Logged through the same pipeline,
+`eventSource: imds.internal`.

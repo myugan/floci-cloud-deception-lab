@@ -432,6 +432,101 @@ data:
                               route: { cluster: floci, timeout: 30s }
                     http_filters: *shared_http_filters
                     access_log: *shared_access_log
+        # Fake EC2 instance metadata service. Automated cloud-recon tools
+        # (Pacu, ScoutSuite, linPEAS, cloud_enum) probe 169.254.169.254
+        # directly, independent of whatever env vars are already visible —
+        # this makes sure they find the canary creds too. Real IMDS is
+        # plain HTTP, unauthenticated at the network level (IMDSv2's
+        # token is a SSRF mitigation, not real auth) — same here, any
+        # token value is accepted.
+        - name: imds_intercept
+          address:
+            socket_address: { address: 169.254.169.254, port_value: 80 }
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: imds_intercept
+                    route_config:
+                      name: local_route
+                      virtual_hosts:
+                        - name: imds
+                          domains: ["*"]
+                          routes:
+                            # Never actually reached — the Lua filter answers
+                            # every request itself via respond(). Router
+                            # still needs a syntactically valid route.
+                            - match: { prefix: "/" }
+                              route: { cluster: floci, timeout: 5s }
+                    http_filters:
+                      - name: envoy.filters.http.lua
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                          default_source_code:
+                            inline_string: |
+                              local function esc(s)
+                                return tostring(s):gsub('[\r\n]', ' '):gsub('\\', '\\\\'):gsub('"', '\\"')
+                              end
+
+                              local ROLE_NAME = "ray-ml-training-role"
+                              local CRED_PATH = "/latest/meta-data/iam/security-credentials/" .. ROLE_NAME
+
+                              function envoy_on_request(request_handle)
+                                local headers = request_handle:headers()
+                                local method = headers:get(":method")
+                                local path = headers:get(":path")
+
+                                local status, ctype, body, event = "404", "text/plain", "", "Unknown"
+
+                                if method == "PUT" and path == "/latest/api/token" then
+                                  status, ctype, body, event = "200", "text/plain", "AQAAAENVUklUWS1UT0tFTi1GQUtFAA==", "GetToken"
+                                elseif method == "GET" and path == "/latest/meta-data/iam/security-credentials/" then
+                                  status, ctype, body, event = "200", "text/plain", ROLE_NAME .. "\n", "ListSecurityCredentials"
+                                elseif method == "GET" and path == CRED_PATH then
+                                  local akid = os.getenv("AWS_ACCESS_KEY_ID") or "unknown"
+                                  local secret = os.getenv("AWS_SECRET_ACCESS_KEY") or "unknown"
+                                  -- Static timestamps, not real time: os.date
+                                  -- isn't guaranteed in this Lua sandbox
+                                  -- (same reason the access log uses Envoy's
+                                  -- %START_TIME% instead of Lua for eventTime).
+                                  body = '{"Code":"Success","LastUpdated":"2026-01-01T00:00:00Z",' ..
+                                    '"Type":"AWS-HMAC","AccessKeyId":"' .. esc(akid) ..
+                                    '","SecretAccessKey":"' .. esc(secret) ..
+                                    '","Token":"","Expiration":"2027-01-01T00:00:00Z"}'
+                                  status, ctype, event = "200", "application/json", "GetSecurityCredentials"
+                                elseif method == "GET" and path == "/latest/meta-data/instance-id" then
+                                  status, ctype, body, event = "200", "text/plain", "i-0a1b2c3d4e5f60789", "GetInstanceId"
+                                elseif method == "GET" and path == "/latest/dynamic/instance-identity/document" then
+                                  body = '{"instanceId":"i-0a1b2c3d4e5f60789","region":"us-east-1","accountId":"000000000000"}'
+                                  status, ctype, event = "200", "application/json", "GetInstanceIdentityDocument"
+                                end
+
+                                local req_id = headers:get("x-request-id") or "unknown"
+                                local rest =
+                                  '"eventVersion":"1.08",' ..
+                                  '"eventSource":"imds.internal",' ..
+                                  '"eventName":"' .. esc(event) .. '",' ..
+                                  '"awsRegion":"us-east-1",' ..
+                                  '"sourceIPAddress":"unknown",' ..
+                                  '"userAgent":"' .. esc(headers:get("user-agent") or "unknown") .. '",' ..
+                                  '"userIdentity":{"type":"IAMUser","accessKeyId":"unknown","accountId":"000000000000"},' ..
+                                  '"requestID":"' .. esc(req_id) .. '",' ..
+                                  '"eventID":"' .. esc(req_id) .. '",' ..
+                                  '"eventType":"AwsApiCall",' ..
+                                  '"managementEvent":true,' ..
+                                  '"recipientAccountId":"000000000000",' ..
+                                  '"eventCategory":"Management",' ..
+                                  '"requestParameters":null,' ..
+                                  '"floci_honeypot":true'
+                                headers:replace("x-ct-event-rest", rest)
+
+                                request_handle:respond({[":status"] = status, ["content-type"] = ctype}, body)
+                              end
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                    access_log: *shared_access_log
       clusters:
         - name: floci
           connect_timeout: 2s
@@ -544,6 +639,9 @@ data:
   setup.sh: |
     #!/bin/sh
     set -eu
+    # Link-local IMDS address isn't routed into the pod netns by default —
+    # assign it to loopback so envoy can bind :80 there.
+    ip addr add 169.254.169.254/32 dev lo
     # Carve-out for the promtail sidecar's log shipping to the cluster's
     # existing Loki (reached over Tailscale at 100.103.210.114) — this is
     # real infrastructure traffic, not part of the AWS deception, and

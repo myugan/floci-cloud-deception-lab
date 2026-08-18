@@ -140,6 +140,11 @@ spec:
         - name: envoy-sidecar
           image: envoyproxy/envoy:v1.31-latest
           args: ["-c", "/etc/envoy/envoy.yaml"]
+          # The IMDS listener's Lua filter hands these back as the fake
+          # role's credentials — same canary key, one more path to find it.
+          envFrom:
+            - secretRef:
+                name: canary-aws-creds
           volumeMounts:
             - name: envoy-config
               mountPath: /etc/envoy
