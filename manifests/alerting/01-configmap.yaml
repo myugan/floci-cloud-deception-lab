@@ -1,40 +1,33 @@
 apiVersion: v1
 data:
   tailer.py: "#!/usr/bin/env python3\n\"\"\"\nTails Loki's real-time WebSocket API
-    for {log_type=\"cloudtrail\"} and posts\nto Discord — one embed per event, as
-    it arrives, no polling delay, no\nfiring/resolved lifecycle (Grafana Alerting
-    is threshold-based and can't\nembed per-event content, which is why this exists
-    instead of an alert\nrule).\n\nTwo things layered on top of the plain \"one message
-    per line\" version:\n\n- Severity coloring: purely a display concern in this script,
-    not a Loki\n  label or anything upstream (deliberately kept out of the log data
-    model\n  per earlier feedback) — just picks an embed color from the action name\n
-    \ so a busy channel is scannable by severity at a glance.\n- Batching: real attacker
-    tooling (Pacu, enumerate-iam, ScoutSuite) fires\n  dozens of calls in seconds.
-    Posting one Discord message per line would\n  flood the channel instantly. Events
-    are buffered for a short window;\n  a lone event still gets its full detailed
-    embed, but a burst collapses\n  into one summary message instead of N separate
-    ones.\n\"\"\"\nimport json\nimport os\nimport re\nimport threading\nimport time\nimport
-    urllib.parse\nfrom collections import Counter\n\nimport requests\nimport websocket\n\nLOKI_WS
-    = (\n    \"ws://loki.loki.svc.cluster.local:3100/loki/api/v1/tail?query=\"\n    +
-    urllib.parse.quote('{log_type=\"cloudtrail\"}')\n)\nDISCORD_WEBHOOK = os.environ[\"DISCORD_WEBHOOK_URL\"]\n\nBATCH_WINDOW_SECONDS
-    = 3\n\nCOLOR_CRITICAL = 0xE74C3C  # red    — privesc / persistence / destructive\nCOLOR_WARNING
+    for {log_type=\"cloudtrail\"} and posts\none Discord embed per event, as it arrives
+    — no batching, no polling delay,\nno firing/resolved lifecycle.\n\nSeverity coloring
+    is purely a display concern here, not a Loki label\n(kept out of the log data
+    model per earlier feedback) — picks an embed\ncolor from the action name so a
+    busy channel is scannable at a glance.\n\nDedup guard: Envoy's Lua callback can
+    fire more than once for the same\nlogical request, producing repeated identical
+    eventIDs in the log. A\nsmall recently-seen set drops repeats so one client call
+    never posts as\nmultiple identical embeds.\n\"\"\"\nimport json\nimport os\nimport
+    re\nimport time\nimport urllib.parse\nfrom collections import deque\n\nimport
+    requests\nimport websocket\n\nLOKI_WS = (\n    \"ws://loki.loki.svc.cluster.local:3100/loki/api/v1/tail?query=\"\n
+    \   + urllib.parse.quote('{log_type=\"cloudtrail\"}')\n)\nDISCORD_WEBHOOK = os.environ[\"DISCORD_WEBHOOK_URL\"]\n\nSEEN_MAX
+    = 500\n\nCOLOR_CRITICAL = 0xE74C3C  # red    — privesc / persistence / destructive\nCOLOR_WARNING
     = 0xE67E22   # orange — general mutating calls\nCOLOR_INFO = 0x95A5A6      # grey
     \  — recon / read-only, routine noise\n\n# Purely for choosing a color — no labels,
     no Loki, nothing upstream.\n_CRITICAL_RE = re.compile(\n    r\"^(Attach.*Policy|Put.*Policy|Detach.*Policy|.*PolicyVersion|AssumeRole.*|\"\n
     \   r\"CreateLoginProfile|UpdateLoginProfile|AddUserToGroup|UpdateAssumeRolePolicy|\"\n
     \   r\"CreateAccessKey|UpdateAccessKey|Delete.*|Terminate.*|Revoke.*)$\"\n)\n_INFO_RE
-    = re.compile(r\"^(Get.*|List.*|Describe.*|Lookup.*)$\")\n\n\ndef severity_color(event_name:
+    = re.compile(r\"^(Get.*|List.*|Describe.*|Lookup.*)$\")\n\ndef severity_color(event_name:
     str) -> int:\n    if _CRITICAL_RE.match(event_name):\n        return COLOR_CRITICAL\n
-    \   if _INFO_RE.match(event_name):\n        return COLOR_INFO\n    return COLOR_WARNING\n\n\ndef
+    \   if _INFO_RE.match(event_name):\n        return COLOR_INFO\n    return COLOR_WARNING\n\ndef
     _truncate(s: str, limit: int) -> str:\n    return s if len(s) <= limit else s[:
-    limit - 1] + \"…\"\n\n\ndef format_embed(d: dict) -> dict:\n    ua = d.get(\"userAgent\",
+    limit - 1] + \"…\"\n\ndef format_embed(d: dict) -> dict:\n    ua = d.get(\"userAgent\",
     \"?\")\n    if len(ua) > 200:\n        ua = ua[:200] + \"…\"\n\n    service_short
     = d.get(\"eventSource\", \"?\").split(\".\")[0]\n    action = d.get(\"eventName\",
     \"?\")\n    title = f\"\U0001F6A8 {service_short}:{action} — canary key triggered\"\n\n
-    \   # Source IP dropped too, same reasoning as Access Key: with a single\n    #
-    decoy pod, it's always the same value — no differentiating signal.\n    fields
-    = [\n        {\"name\": \"Service\", \"value\": f\"`{d.get('eventSource', '?')}`\",
-    \"inline\": True},\n        {\"name\": \"Action\", \"value\": f\"**{action}**\",
+    \   fields = [\n        {\"name\": \"Service\", \"value\": f\"`{d.get('eventSource',
+    '?')}`\", \"inline\": True},\n        {\"name\": \"Action\", \"value\": f\"**{action}**\",
     \"inline\": True},\n        {\"name\": \"Region\", \"value\": f\"`{d.get('awsRegion',
     '?')}`\", \"inline\": True},\n    ]\n\n    params = d.get(\"requestParameters\")\n
     \   if params:\n        params_str = _truncate(json.dumps(params), 1000)\n        fields.append({\"name\":
@@ -42,44 +35,27 @@ data:
     \   fields.append({\"name\": \"User-Agent\", \"value\": f\"```{ua}```\", \"inline\":
     False})\n\n    return {\n        \"title\": title,\n        \"color\": severity_color(action),\n
     \       \"fields\": fields,\n        \"footer\": {\"text\": \"floci-deception\"},\n
-    \       \"timestamp\": d.get(\"eventTime\"),\n    }\n\n\ndef format_batch_embed(events:
-    list) -> dict:\n    counts = Counter(f\"{e.get('eventSource', '?').split('.')[0]}:{e.get('eventName',
-    '?')}\" for e in events)\n    # Escalate to the worst severity present in the
-    burst.\n    color = COLOR_INFO\n    for e in events:\n        c = severity_color(e.get(\"eventName\",
-    \"?\"))\n        if c == COLOR_CRITICAL:\n            color = COLOR_CRITICAL\n
-    \           break\n        if c == COLOR_WARNING and color != COLOR_CRITICAL:\n
-    \           color = COLOR_WARNING\n\n    lines = [f\"`{n}` × {c}\" for n, c in
-    counts.most_common(15)]\n\n    return {\n        \"title\": f\"\U0001F6A8 Burst:
-    {len(events)} canary key calls in {BATCH_WINDOW_SECONDS}s\",\n        \"color\":
-    color,\n        \"fields\": [\n            {\"name\": \"Calls\", \"value\": \"\\n\".join(lines),
-    \"inline\": False},\n        ],\n        \"footer\": {\"text\": \"floci-deception\"},\n
-    \       \"timestamp\": events[-1].get(\"eventTime\"),\n    }\n\n\ndef post_discord(payload:
+    \       \"timestamp\": d.get(\"eventTime\"),\n    }\n\ndef post_discord(payload:
     dict):\n    try:\n        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)\n
     \       print(f\"posted to discord: status={r.status_code}\", flush=True)\n    except
-    Exception as e:\n        print(f\"discord post failed: {e}\", flush=True)\n\n\nclass
-    Batcher:\n    \"\"\"Collects events for BATCH_WINDOW_SECONDS. A lone event in
-    the\n    window gets its full detailed embed; two or more collapse into one\n
-    \   summary message.\"\"\"\n\n    def __init__(self):\n        self._lock = threading.Lock()\n
-    \       self._pending: list = []\n        thread = threading.Thread(target=self._flush_loop,
-    daemon=True)\n        thread.start()\n\n    def add(self, event: dict):\n        with
-    self._lock:\n            self._pending.append(event)\n\n    def _flush_loop(self):\n
-    \       while True:\n            time.sleep(BATCH_WINDOW_SECONDS)\n            with
-    self._lock:\n                batch, self._pending = self._pending, []\n            if
-    not batch:\n                continue\n            if len(batch) == 1:\n                post_discord({\"embeds\":
-    [format_embed(batch[0])]})\n            else:\n                post_discord({\"embeds\":
-    [format_batch_embed(batch)]})\n\n\nbatcher = Batcher()\n\n\ndef on_message(ws,
-    message):\n    data = json.loads(message)\n    for stream in data.get(\"streams\",
-    []):\n        for _ts, line in stream.get(\"values\", []):\n            try:\n
-    \               batcher.add(json.loads(line))\n            except Exception:\n
-    \               post_discord({\"content\": f\"cloudtrail activity (unparsed):
-    {line[:200]}\"})\n\n\ndef on_error(ws, error):\n    print(f\"ws error: {error}\",
-    flush=True)\n\n\ndef on_close(ws, *_a):\n    print(\"ws closed\", flush=True)\n\n\ndef
-    on_open(ws):\n    print(f\"ws connected: {LOKI_WS}\", flush=True)\n\n\ndef main():\n
-    \   while True:\n        ws = websocket.WebSocketApp(\n            LOKI_WS,\n
-    \           on_open=on_open,\n            on_message=on_message,\n            on_error=on_error,\n
-    \           on_close=on_close,\n        )\n        ws.run_forever()\n        print(\"reconnecting
-    in 5s\", flush=True)\n        time.sleep(5)\n\n\nif __name__ == \"__main__\":\n
-    \   main()\n"
+    Exception as e:\n        print(f\"discord post failed: {e}\", flush=True)\n\n_seen_ids
+    = set()\n_seen_order = deque()\n\ndef already_seen(event_id: str) -> bool:\n    if
+    not event_id:\n        return False\n    if event_id in _seen_ids:\n        return
+    True\n    _seen_ids.add(event_id)\n    _seen_order.append(event_id)\n    if len(_seen_order)
+    > SEEN_MAX:\n        old = _seen_order.popleft()\n        _seen_ids.discard(old)\n
+    \   return False\n\ndef on_message(ws, message):\n    data = json.loads(message)\n
+    \   for stream in data.get(\"streams\", []):\n        for _ts, line in stream.get(\"values\",
+    []):\n            try:\n                event = json.loads(line)\n            except
+    Exception:\n                post_discord({\"content\": f\"cloudtrail activity
+    (unparsed): {line[:200]}\"})\n                continue\n            if already_seen(event.get(\"requestID\")):\n
+    \               continue\n            post_discord({\"embeds\": [format_embed(event)]})\n\ndef
+    on_error(ws, error):\n    print(f\"ws error: {error}\", flush=True)\n\ndef on_close(ws,
+    *_a):\n    print(\"ws closed\", flush=True)\n\ndef on_open(ws):\n    print(f\"ws
+    connected: {LOKI_WS}\", flush=True)\n\ndef main():\n    while True:\n        ws
+    = websocket.WebSocketApp(\n            LOKI_WS,\n            on_open=on_open,\n
+    \           on_message=on_message,\n            on_error=on_error,\n            on_close=on_close,\n
+    \       )\n        ws.run_forever()\n        print(\"reconnecting in 5s\", flush=True)\n
+    \       time.sleep(5)\n\nif __name__ == \"__main__\":\n    main()\n"
 kind: ConfigMap
 metadata:
   name: discord-alert-tailer-script

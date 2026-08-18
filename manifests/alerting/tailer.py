@@ -1,30 +1,24 @@
 #!/usr/bin/env python3
 """
 Tails Loki's real-time WebSocket API for {log_type="cloudtrail"} and posts
-to Discord — one embed per event, as it arrives, no polling delay, no
-firing/resolved lifecycle (Grafana Alerting is threshold-based and can't
-embed per-event content, which is why this exists instead of an alert
-rule).
+one Discord embed per event, as it arrives — no batching, no polling delay,
+no firing/resolved lifecycle.
 
-Two things layered on top of the plain "one message per line" version:
+Severity coloring is purely a display concern here, not a Loki label
+(kept out of the log data model per earlier feedback) — picks an embed
+color from the action name so a busy channel is scannable at a glance.
 
-- Severity coloring: purely a display concern in this script, not a Loki
-  label or anything upstream (deliberately kept out of the log data model
-  per earlier feedback) — just picks an embed color from the action name
-  so a busy channel is scannable by severity at a glance.
-- Batching: real attacker tooling (Pacu, enumerate-iam, ScoutSuite) fires
-  dozens of calls in seconds. Posting one Discord message per line would
-  flood the channel instantly. Events are buffered for a short window;
-  a lone event still gets its full detailed embed, but a burst collapses
-  into one summary message instead of N separate ones.
+Dedup guard: Envoy's Lua callback can fire more than once for the same
+logical request, producing repeated identical eventIDs in the log. A
+small recently-seen set drops repeats so one client call never posts as
+multiple identical embeds.
 """
 import json
 import os
 import re
-import threading
 import time
 import urllib.parse
-from collections import Counter
+from collections import deque
 
 import requests
 import websocket
@@ -35,7 +29,7 @@ LOKI_WS = (
 )
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 
-BATCH_WINDOW_SECONDS = 3
+SEEN_MAX = 500
 
 COLOR_CRITICAL = 0xE74C3C  # red    — privesc / persistence / destructive
 COLOR_WARNING = 0xE67E22   # orange — general mutating calls
@@ -49,7 +43,6 @@ _CRITICAL_RE = re.compile(
 )
 _INFO_RE = re.compile(r"^(Get.*|List.*|Describe.*|Lookup.*)$")
 
-
 def severity_color(event_name: str) -> int:
     if _CRITICAL_RE.match(event_name):
         return COLOR_CRITICAL
@@ -57,10 +50,8 @@ def severity_color(event_name: str) -> int:
         return COLOR_INFO
     return COLOR_WARNING
 
-
 def _truncate(s: str, limit: int) -> str:
     return s if len(s) <= limit else s[: limit - 1] + "…"
-
 
 def format_embed(d: dict) -> dict:
     ua = d.get("userAgent", "?")
@@ -71,8 +62,6 @@ def format_embed(d: dict) -> dict:
     action = d.get("eventName", "?")
     title = f"🚨 {service_short}:{action} — canary key triggered"
 
-    # Source IP dropped too, same reasoning as Access Key: with a single
-    # decoy pod, it's always the same value — no differentiating signal.
     fields = [
         {"name": "Service", "value": f"`{d.get('eventSource', '?')}`", "inline": True},
         {"name": "Action", "value": f"**{action}**", "inline": True},
@@ -94,32 +83,6 @@ def format_embed(d: dict) -> dict:
         "timestamp": d.get("eventTime"),
     }
 
-
-def format_batch_embed(events: list) -> dict:
-    counts = Counter(f"{e.get('eventSource', '?').split('.')[0]}:{e.get('eventName', '?')}" for e in events)
-    # Escalate to the worst severity present in the burst.
-    color = COLOR_INFO
-    for e in events:
-        c = severity_color(e.get("eventName", "?"))
-        if c == COLOR_CRITICAL:
-            color = COLOR_CRITICAL
-            break
-        if c == COLOR_WARNING and color != COLOR_CRITICAL:
-            color = COLOR_WARNING
-
-    lines = [f"`{n}` × {c}" for n, c in counts.most_common(15)]
-
-    return {
-        "title": f"🚨 Burst: {len(events)} canary key calls in {BATCH_WINDOW_SECONDS}s",
-        "color": color,
-        "fields": [
-            {"name": "Calls", "value": "\n".join(lines), "inline": False},
-        ],
-        "footer": {"text": "floci-deception"},
-        "timestamp": events[-1].get("eventTime"),
-    }
-
-
 def post_discord(payload: dict):
     try:
         r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
@@ -127,59 +90,42 @@ def post_discord(payload: dict):
     except Exception as e:
         print(f"discord post failed: {e}", flush=True)
 
+_seen_ids = set()
+_seen_order = deque()
 
-class Batcher:
-    """Collects events for BATCH_WINDOW_SECONDS. A lone event in the
-    window gets its full detailed embed; two or more collapse into one
-    summary message."""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._pending: list = []
-        thread = threading.Thread(target=self._flush_loop, daemon=True)
-        thread.start()
-
-    def add(self, event: dict):
-        with self._lock:
-            self._pending.append(event)
-
-    def _flush_loop(self):
-        while True:
-            time.sleep(BATCH_WINDOW_SECONDS)
-            with self._lock:
-                batch, self._pending = self._pending, []
-            if not batch:
-                continue
-            if len(batch) == 1:
-                post_discord({"embeds": [format_embed(batch[0])]})
-            else:
-                post_discord({"embeds": [format_batch_embed(batch)]})
-
-
-batcher = Batcher()
-
+def already_seen(event_id: str) -> bool:
+    if not event_id:
+        return False
+    if event_id in _seen_ids:
+        return True
+    _seen_ids.add(event_id)
+    _seen_order.append(event_id)
+    if len(_seen_order) > SEEN_MAX:
+        old = _seen_order.popleft()
+        _seen_ids.discard(old)
+    return False
 
 def on_message(ws, message):
     data = json.loads(message)
     for stream in data.get("streams", []):
         for _ts, line in stream.get("values", []):
             try:
-                batcher.add(json.loads(line))
+                event = json.loads(line)
             except Exception:
                 post_discord({"content": f"cloudtrail activity (unparsed): {line[:200]}"})
-
+                continue
+            if already_seen(event.get("requestID")):
+                continue
+            post_discord({"embeds": [format_embed(event)]})
 
 def on_error(ws, error):
     print(f"ws error: {error}", flush=True)
 
-
 def on_close(ws, *_a):
     print("ws closed", flush=True)
 
-
 def on_open(ws):
     print(f"ws connected: {LOKI_WS}", flush=True)
-
 
 def main():
     while True:
@@ -193,7 +139,6 @@ def main():
         ws.run_forever()
         print("reconnecting in 5s", flush=True)
         time.sleep(5)
-
 
 if __name__ == "__main__":
     main()
