@@ -21,9 +21,13 @@ WORKDIR=$(mktemp -d)
 cd "$WORKDIR"
 
 echo "generating CA..." >&2
+# Subject/CN deliberately generic: this cert is mounted where a
+# compromised decoy-app can read it, and `openssl x509 -subject` is
+# the first thing anyone checking whether TLS is being intercepted
+# would run. Anything honeypot-flavored here is a confession.
 openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
   -keyout ca-key.pem -out ca-cert.pem \
-  -subj "/O=aws-honeypot/CN=floci-mitm-ca" >/dev/null 2>&1
+  -subj "/O=Internal PKI/CN=Internal Root CA" >/dev/null 2>&1
 
 echo "building SAN list (all AWS regions, incl. S3 virtual-hosted)..." >&2
 python3 - > leaf.ext <<'PYEOF'
@@ -47,7 +51,7 @@ PYEOF
 
 echo "generating leaf cert, signed by the CA above..." >&2
 openssl req -newkey rsa:2048 -nodes -keyout leaf-key.pem -out leaf.csr \
-  -subj "/O=aws-honeypot/CN=*.amazonaws.com" >/dev/null 2>&1
+  -subj "/O=Internal PKI/CN=*.amazonaws.com" >/dev/null 2>&1
 openssl x509 -req -in leaf.csr -CA ca-cert.pem -CAkey ca-key.pem \
   -CAcreateserial -days 825 -extfile leaf.ext -out leaf-cert.pem >/dev/null 2>&1
 
@@ -56,7 +60,7 @@ echo "generated in: $WORKDIR" >&2
 if [ "${1:-}" = "--apply" ]; then
   kubectl create secret generic honeypot-ca-cert \
     --namespace=floci-deception \
-    --from-file=mitmproxy-ca-cert.pem=ca-cert.pem \
+    --from-file=ca-bundle.pem=ca-cert.pem \
     --dry-run=client -o yaml | kubectl apply -f -
 
   kubectl create secret generic honeypot-tls-leaf \

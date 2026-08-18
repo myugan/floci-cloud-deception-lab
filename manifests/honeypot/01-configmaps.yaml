@@ -469,7 +469,12 @@ data:
                                 return tostring(s):gsub('[\r\n]', ' '):gsub('\\', '\\\\'):gsub('"', '\\"')
                               end
 
-                              local ROLE_NAME = "ray-ml-training-role"
+                              -- Name implies a network restriction that
+                              -- doesn't actually exist (floci enforces no
+                              -- IAM at all) -- reads as "not worth taking
+                              -- this off-network" to anyone who's seen a
+                              -- real VPC-endpoint-restricted role before.
+                              local ROLE_NAME = "ray-ml-training-role-vpce-restricted"
                               local CRED_PATH = "/latest/meta-data/iam/security-credentials/" .. ROLE_NAME
 
                               function envoy_on_request(request_handle)
@@ -589,17 +594,49 @@ data:
 apiVersion: v1
 kind: ConfigMap
 metadata:
+  name: honeypot-fake-iam-policy
+  namespace: floci-deception
+data:
+  # Sits next to the real credentials file (/home/ray/.aws/) as bait
+  # in itself — a Deny-unless-SourceVpce condition reads as "this key
+  # is useless off our network" to anyone who's seen a real VPC-
+  # endpoint-restricted policy. floci enforces no IAM at all, so
+  # nothing here is real; the goal is just to discourage exfiltration
+  # in favor of using the key live in this shell.
+  iam-policy.json: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "DenyOutsideMLComputeVPCEndpoint",
+          "Effect": "Deny",
+          "NotAction": "sts:GetCallerIdentity",
+          "Resource": "*",
+          "Condition": {
+            "StringNotEquals": {
+              "aws:SourceVpce": "vpce-0f3a8b2c9d1e4f5a6"
+            }
+          }
+        }
+      ]
+    }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
   name: honeypot-env-scrub
   namespace: floci-deception
 data:
+  # This file is mounted straight into the workload container and is
+  # fully readable from a compromised shell -- no comments in it that
+  # wouldn't survive being read by whoever's inside. enableServiceLinks:
+  # false doesn't stop kubelet injecting KUBERNETES_SERVICE_*/PORT* env
+  # vars for the built-in "kubernetes" Service (verified: that setting
+  # only governs vars for other Services in the namespace), so this
+  # strips them before exec'ing the real command.
   entrypoint.sh: |
     #!/bin/sh
-    # Kubernetes injects KUBERNETES_SERVICE_*/KUBERNETES_PORT* for the
-    # built-in "kubernetes" service into every pod unconditionally —
-    # enableServiceLinks:false does NOT suppress it (verified: it only
-    # governs env vars for other Services in the namespace). Strip them
-    # here before the real decoy workload execs, so nothing in its
-    # environment points at the API server.
     for v in $(env | cut -d= -f1 | grep '^KUBERNETES_'); do
       unset "$v"
     done

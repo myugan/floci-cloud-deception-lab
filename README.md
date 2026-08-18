@@ -22,7 +22,7 @@ queryable via LogQL, and posted to Discord in real time.
 ║ pod: floci-deception (one pod, one netns, all 4            ║
 ║ containers below share it)                                 ║
 ║                                                            ║
-║   decoy-app (Ray)                                          ║
+║   ml-worker (Ray)                                          ║
 ║     no auth, runs a shell command as a "job",              ║
 ║     has the canary AWS key in its environment              ║
 ║         │  boto3 call, no --endpoint-url                   ║
@@ -57,7 +57,7 @@ queryable via LogQL, and posted to Discord in real time.
 
 ## The bait
 
-`decoy-app` runs `rayproject/ray:2.9.0-py311`, vulnerable to the
+`ml-worker` runs `rayproject/ray:2.9.0-py311`, vulnerable to the
 "ShadowRay"-class issue (CVE-2025-62593 / CVE-2023-48022): Ray's
 dashboard API has no authentication by design.
 
@@ -146,7 +146,7 @@ Run any of them any time to rotate.
 
 ## Scope
 
-**This only sees activity from *inside* the `decoy-app` netns** — an
+**This only sees activity from *inside* the `ml-worker` netns** — an
 attacker who gets RCE into the pod and runs AWS calls from that shell.
 It does **not** catch a key leaked publicly (GitHub, Slack, etc.) and
 used from the attacker's own network — that traffic never touches this

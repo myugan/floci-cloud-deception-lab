@@ -15,7 +15,12 @@ spec:
       labels:
         app: floci-deception
     spec:
-      shareProcessNamespace: true
+      # No shared PID namespace: with it on, `ps aux` inside a compromised
+      # container shows every other container's full command line —
+      # envoy's args, floci's own process name, promtail's config path.
+      # Nothing here actually needs cross-container process visibility
+      # (everything talks over loopback, not signals), so it stays off.
+      #
       # Deny-by-default posture against the pod ever being fingerprinted
       # as Kubernetes or reaching the API server:
       automountServiceAccountToken: false   # no token/ca.crt/namespace files, no real credential to steal
@@ -78,7 +83,7 @@ spec:
         # Keep the command wrapper — it strips the KUBERNETES_* env vars
         # kubelet injects unconditionally, so the real app never sees
         # them either.
-        - name: decoy-app
+        - name: ml-worker
           image: rayproject/ray:2.9.0-py311
           command:
             - /scripts/entrypoint.sh
@@ -101,18 +106,22 @@ spec:
                 name: canary-aws-creds
           env:
             # aws-cli / botocore honor these directly — no code changes
-            # needed in the decoy app to trust the interception CA.
+            # needed in the app to trust the interception CA. Path and
+            # filename kept generic on purpose: `env` is the first thing
+            # a compromised shell gets run in it, and a name like
+            # ".../mitmproxy-ca-cert.pem" would confess the interception
+            # outright.
             - name: AWS_CA_BUNDLE
-              value: /honeypot-ca/mitmproxy-ca-cert.pem
+              value: /ca-bundle/ca-bundle.pem
             - name: REQUESTS_CA_BUNDLE
-              value: /honeypot-ca/mitmproxy-ca-cert.pem
+              value: /ca-bundle/ca-bundle.pem
             - name: SSL_CERT_FILE
-              value: /honeypot-ca/mitmproxy-ca-cert.pem
+              value: /ca-bundle/ca-bundle.pem
           volumeMounts:
-            - name: honeypot-ca
-              mountPath: /honeypot-ca
+            - name: ca-bundle
+              mountPath: /ca-bundle
               readOnly: true
-            - name: canary-creds-file
+            - name: aws-creds
               # Ray's image runs as uid 1000 "ray" with HOME=/home/ray
               # (checked via `docker run --entrypoint sh ... echo $HOME`
               # — learned from the earlier Langflow mount, where /root
@@ -120,15 +129,25 @@ spec:
               # the standard ~/.aws/credentials path here is realistic
               # bait; the env vars below are what boto3 actually checks
               # first anyway.
-              mountPath: /home/ray/.aws
+              mountPath: /home/ray/.aws/credentials
+              subPath: credentials
               readOnly: true
-            - name: env-scrub
+            - name: iam-policy
+              # Sits next to the real credentials file. A Deny-unless-
+              # SourceVpce condition reads as "this key won't work off
+              # our network" — nudges an attacker to use it live in this
+              # shell instead of bothering to exfiltrate it. floci
+              # doesn't enforce IAM at all, so this is pure appearance.
+              mountPath: /home/ray/.aws/iam-policy.json
+              subPath: iam-policy.json
+              readOnly: true
+            - name: init-wrapper
               mountPath: /scripts
               readOnly: true
-            - name: docker-facade
+            - name: hostfiles
               mountPath: /etc/hosts
               subPath: hosts
-            - name: docker-facade
+            - name: hostfiles
               mountPath: /.dockerenv
               subPath: dockerenv
 
@@ -188,11 +207,11 @@ spec:
           configMap:
             name: honeypot-iptables-setup
             defaultMode: 0555
-        - name: env-scrub
+        - name: init-wrapper
           configMap:
             name: honeypot-env-scrub
             defaultMode: 0555
-        - name: docker-facade
+        - name: hostfiles
           configMap:
             name: honeypot-docker-facade
         - name: envoy-config
@@ -201,15 +220,18 @@ spec:
         - name: tls-leaf
           secret:
             secretName: honeypot-tls-leaf
-        - name: honeypot-ca
+        - name: ca-bundle
           secret:
             secretName: honeypot-ca-cert
-        - name: canary-creds-file
+        - name: aws-creds
           secret:
             secretName: canary-aws-creds
             items:
               - key: credentials
                 path: credentials
+        - name: iam-policy
+          configMap:
+            name: honeypot-fake-iam-policy
         - name: floci-data
           emptyDir: {}
         - name: ct-logs
