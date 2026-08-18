@@ -1,0 +1,214 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: floci-deception
+  namespace: floci-deception
+  labels:
+    app: floci-deception
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: floci-deception
+  template:
+    metadata:
+      labels:
+        app: floci-deception
+    spec:
+      shareProcessNamespace: true
+      # Deny-by-default posture against the pod ever being fingerprinted
+      # as Kubernetes or reaching the API server:
+      automountServiceAccountToken: false   # no token/ca.crt/namespace files, no real credential to steal
+      enableServiceLinks: false             # no KUBERNETES_SERVICE_HOST/PORT env vars
+      # Docker-style random-hex hostname — this is what a plain `docker
+      # run` container gets by default (a short container ID), not an
+      # EC2 instance name and not a ReplicaSet-hash pod name. Coherent
+      # with the /etc/hosts and /.dockerenv facade below: real Docker
+      # containers essentially never inherit their host VM's hostname.
+      hostname: 16f4c16e35b8
+      # No cluster DNS: dnsPolicy:None + explicit nameservers means
+      # resolv.conf never gets the "search <ns>.svc.cluster.local
+      # svc.cluster.local cluster.local" lines kubelet would otherwise add.
+      # Safe to drop cluster DNS entirely here — the honeypot redirect
+      # (iptables REDIRECT by destination port) doesn't depend on what
+      # amazonaws.com resolves to, and envoy talks to floci by static IP.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 1.1.1.1
+          - 8.8.8.8
+      initContainers:
+        # Installs an iptables NAT rule so port 443 leaving THIS pod's
+        # netns gets REDIRECTed to the envoy sidecar on loopback,
+        # regardless of what host the client actually dialed. This is why
+        # no --endpoint-url or AWS_ENDPOINT_URL is required — interception
+        # happens below the application layer.
+        - name: iptables-setup
+          image: nicolaka/netshoot:latest
+          command: ["/bin/sh", "/scripts/setup.sh"]
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+            runAsUser: 0
+          volumeMounts:
+            - name: iptables-script
+              mountPath: /scripts
+
+      containers:
+        # The actual bait: Ray 2.9.0, vulnerable to the "ShadowRay"-class
+        # issue (CVE-2025-62593 and its predecessor CVE-2023-48022) — the
+        # Ray dashboard/job-submission API has no real authentication by
+        # design. A direct network attacker doesn't even need this CVE's
+        # specific DNS-rebinding/User-Agent-spoofing trick (that's only
+        # for tricking a victim's *browser* into same-origin bypass) —
+        # they just POST straight to /api/jobs/ with a shell command as
+        # the entrypoint. No auth, no fragile payload construction (this
+        # replaced an earlier Langflow pick — CVE-2026-9198's exec chain
+        # needed an undocumented lambda/generator-wrapped function shape
+        # that wasn't worth fighting further). Fixed in 2.52.0 — this pin
+        # is deliberate. CISA KEV added it 2026-08-17, linked to active
+        # abuse by the RondoDox botnet.
+        #
+        # Thematically apt: Ray clusters routinely hold cloud credentials
+        # for autoscaling compute — "attacker RCEs an ML training
+        # cluster and finds cloud creds in its environment" is exactly
+        # the ShadowRay campaigns' real-world pattern, not a contrived
+        # one. Shares this pod's network namespace, so any AWS call the
+        # attacker's submitted job makes gets captured automatically.
+        # Keep the command wrapper — it strips the KUBERNETES_* env vars
+        # kubelet injects unconditionally, so the real app never sees
+        # them either.
+        - name: decoy-app
+          image: rayproject/ray:2.9.0-py311
+          command:
+            - /scripts/entrypoint.sh
+            - ray
+            - start
+            - --head
+            - --dashboard-host=0.0.0.0
+            - --block
+          ports:
+            - containerPort: 8265
+              name: dashboard
+          # Default is /dev/termination-log — a famous, unconditionally-
+          # mounted k8s-only file that a lot of automated "is this
+          # Kubernetes" scripts grep for by exact path. The mount itself
+          # can't be removed, but renaming it off a script's wordlist is
+          # the practical mitigation.
+          terminationMessagePath: /var/log/.exitstatus
+          envFrom:
+            - secretRef:
+                name: canary-aws-creds
+          env:
+            # aws-cli / botocore honor these directly — no code changes
+            # needed in the decoy app to trust the interception CA.
+            - name: AWS_CA_BUNDLE
+              value: /honeypot-ca/mitmproxy-ca-cert.pem
+            - name: REQUESTS_CA_BUNDLE
+              value: /honeypot-ca/mitmproxy-ca-cert.pem
+            - name: SSL_CERT_FILE
+              value: /honeypot-ca/mitmproxy-ca-cert.pem
+          volumeMounts:
+            - name: honeypot-ca
+              mountPath: /honeypot-ca
+              readOnly: true
+            - name: canary-creds-file
+              # Ray's image runs as uid 1000 "ray" with HOME=/home/ray
+              # (checked via `docker run --entrypoint sh ... echo $HOME`
+              # — learned from the earlier Langflow mount, where /root
+              # was wrong for that image's non-root user too). Mounting
+              # the standard ~/.aws/credentials path here is realistic
+              # bait; the env vars below are what boto3 actually checks
+              # first anyway.
+              mountPath: /home/ray/.aws
+              readOnly: true
+            - name: env-scrub
+              mountPath: /scripts
+              readOnly: true
+            - name: docker-facade
+              mountPath: /etc/hosts
+              subPath: hosts
+            - name: docker-facade
+              mountPath: /.dockerenv
+              subPath: dockerenv
+
+        # TLS-terminating sidecar: envoy decrypts the redirected 443
+        # traffic with a static *.amazonaws.com leaf cert (signed by our
+        # CA, so the decoy-app's AWS_CA_BUNDLE trusts it) and forwards
+        # every request as-is to floci:4566 over plain HTTP. No per-flow
+        # scripting, no outbound dialing — static config only.
+        - name: envoy-sidecar
+          image: envoyproxy/envoy:v1.31-latest
+          args: ["-c", "/etc/envoy/envoy.yaml"]
+          volumeMounts:
+            - name: envoy-config
+              mountPath: /etc/envoy
+            - name: tls-leaf
+              mountPath: /certs
+              readOnly: true
+            - name: ct-logs
+              mountPath: /var/log/floci-ct
+
+        # Tails Envoy's file-based CloudTrail-shaped access log and ships
+        # it to the cluster's existing Loki (over Tailscale) so it's
+        # queryable with LogQL like real CloudTrail: e.g.
+        # {job="floci-deception"} | json | eventName="CreateUser"
+        - name: promtail
+          image: grafana/promtail:latest
+          args: ["-config.file=/etc/promtail/promtail.yaml"]
+          volumeMounts:
+            - name: ct-logs
+              mountPath: /var/log/floci-ct
+              readOnly: true
+            - name: promtail-config
+              mountPath: /etc/promtail
+
+        # The honeypot itself: 75-service AWS emulator on :4566, dummy
+        # creds accepted, real engines for Lambda/RDS/etc. This is what
+        # every intercepted AWS call actually lands on.
+        - name: floci
+          image: floci/floci:latest
+          ports:
+            - containerPort: 4566
+              name: edge
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+          volumeMounts:
+            - name: floci-data
+              mountPath: /var/lib/floci
+
+      volumes:
+        - name: iptables-script
+          configMap:
+            name: honeypot-iptables-setup
+            defaultMode: 0555
+        - name: env-scrub
+          configMap:
+            name: honeypot-env-scrub
+            defaultMode: 0555
+        - name: docker-facade
+          configMap:
+            name: honeypot-docker-facade
+        - name: envoy-config
+          configMap:
+            name: honeypot-envoy-config
+        - name: tls-leaf
+          secret:
+            secretName: honeypot-tls-leaf
+        - name: honeypot-ca
+          secret:
+            secretName: honeypot-ca-cert
+        - name: canary-creds-file
+          secret:
+            secretName: canary-aws-creds
+            items:
+              - key: credentials
+                path: credentials
+        - name: floci-data
+          emptyDir: {}
+        - name: ct-logs
+          emptyDir: {}
+        - name: promtail-config
+          configMap:
+            name: honeypot-promtail-config

@@ -1,0 +1,500 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: honeypot-envoy-config
+  namespace: floci-deception
+data:
+  envoy.yaml: |
+    # Terminates the redirected TLS traffic with a static *.amazonaws.com
+    # leaf cert (signed by our CA) and forwards every request, headers
+    # untouched, to floci over plain HTTP on loopback. floci's edge router
+    # dispatches by parsing the SigV4 Authorization header's
+    # Credential=.../<region>/<service>/... scope, not by Host, so leaving
+    # Host/Authorization exactly as the client signed them still routes
+    # correctly — and floci's own access log captures the real (stolen)
+    # access key + intended service/action verbatim for forensics.
+    static_resources:
+      listeners:
+        - name: aws_intercept
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 8443 }
+          filter_chains:
+            - transport_socket:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                  common_tls_context:
+                    tls_certificates:
+                      - certificate_chain: { filename: "/certs/leaf-cert.pem" }
+                        private_key: { filename: "/certs/leaf-key.pem" }
+              filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: aws_intercept
+                    route_config:
+                      name: local_route
+                      virtual_hosts:
+                        - name: floci
+                          domains: ["*"]
+                          routes:
+                            - match: { prefix: "/" }
+                              route: { cluster: floci, timeout: 30s }
+                    http_filters:
+                      # Builds a real AWS CloudTrail-shaped event record —
+                      # same field names or the actual thing (eventSource,
+                      # eventName, userIdentity, awsRegion, sourceIPAddress,
+                      # userAgent, requestID) — so this reads like, and can
+                      # be parsed by, tooling that already expects
+                      # CloudTrail JSON. floci's own CloudTrail emulation
+                      # doesn't actually populate lookup-events (tested:
+                      # always returns empty, even after real write
+                      # actions), so this is what stands in for it.
+                      #
+                      # - eventSource/eventName: service comes from the
+                      #   Authorization header's Credential=.../<region>/
+                      #   <service>/... scope (always present, SigV4
+                      #   requires it); action comes from X-Amz-Target
+                      #   (JSON-protocol services) or the POST body's
+                      #   Action=X (STS/IAM/EC2 "query protocol"); S3 has
+                      #   neither (REST-shaped) so falls back to
+                      #   "METHOD /path".
+                      # - userIdentity.accessKeyId: the actual stolen key
+                      #   in use, straight from the same Credential scope.
+                      # - requestID/eventID: reuses Envoy's own
+                      #   x-request-id (real CloudTrail has these as two
+                      #   distinct UUIDs; this is a simplification).
+                      # - requestParameters: for query-protocol calls
+                      #   (STS/IAM/EC2), the POST body's key=value pairs
+                      #   minus Action/Version (e.g. CreateUser's
+                      #   UserName); for JSON-protocol calls (DynamoDB,
+                      #   Lambda) the body IS already the parameters, so
+                      #   it's passed through as-is. Not populated for
+                      #   REST-shaped services (S3) — no single params
+                      #   blob there, and request bodies can be raw file
+                      #   data anyway.
+                      # - responseElements/errorCode: NOT populated —
+                      #   errorCode never applies anyway since floci
+                      #   doesn't enforce IAM (nothing is ever denied) —
+                      #   known, deliberate gap.
+                      - name: envoy.filters.http.lua
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                          default_source_code:
+                            inline_string: |
+                              local function esc(s)
+                                return tostring(s):gsub('[\r\n]', ' '):gsub('\\', '\\\\'):gsub('"', '\\"')
+                              end
+
+                              local function url_decode(s)
+                                s = s:gsub('+', ' ')
+                                s = s:gsub('%%(%x%x)', function(h)
+                                  return string.char(tonumber(h, 16))
+                                end)
+                                return s
+                              end
+
+                              -- Query-protocol body (Action=X&UserName=Y&...) minus
+                              -- Action/Version -> a small JSON object, e.g. CreateUser's
+                              -- {"UserName":"foo"}. Truncated defensively so a huge body
+                              -- can't blow header size limits or Discord's field limits.
+                              local function parse_query_params(raw)
+                                local parts = {}
+                                for pair in raw:gmatch('[^&]+') do
+                                  local k, v = pair:match('([^=]+)=?(.*)')
+                                  if k then
+                                    k = url_decode(k)
+                                    if k ~= "Action" and k ~= "Version" then
+                                      table.insert(parts, '"' .. esc(k) .. '":"' .. esc(url_decode(v or "")) .. '"')
+                                    end
+                                  end
+                                end
+                                if #parts == 0 then
+                                  return "null"
+                                end
+                                -- Left as valid JSON always (no naive
+                                -- string truncation here — cutting mid-
+                                -- object would break the JSON). Display-
+                                -- side truncation (Discord field limits
+                                -- etc.) happens downstream instead.
+                                return "{" .. table.concat(parts, ",") .. "}"
+                              end
+
+                              -- S3 is REST-shaped: there's no Action= param or
+                              -- X-Amz-Target, so real CloudTrail infers the
+                              -- eventName from method + bucket/key presence +
+                              -- subresource query params (?acl, ?policy, ...).
+                              -- Covers the common bucket/object CRUD + the
+                              -- usual subresources; deliberately not
+                              -- exhaustive (multipart upload steps, SELECT,
+                              -- etc. aren't covered — falls back to
+                              -- "METHOD /path" same as before for those).
+                              local function qs_has_param(qs, name)
+                                if not qs then
+                                  return false
+                                end
+                                for pair in qs:gmatch('[^&]+') do
+                                  if pair:match('^([^=]+)') == name then
+                                    return true
+                                  end
+                                end
+                                return false
+                              end
+
+                              local SUBRESOURCE_GET = {
+                                acl = "GetBucketAcl", policy = "GetBucketPolicy", tagging = "GetBucketTagging",
+                                versioning = "GetBucketVersioning", location = "GetBucketLocation",
+                                lifecycle = "GetBucketLifecycleConfiguration", cors = "GetBucketCors",
+                                logging = "GetBucketLogging", replication = "GetBucketReplication",
+                                encryption = "GetBucketEncryption", website = "GetBucketWebsite",
+                                publicAccessBlock = "GetPublicAccessBlock",
+                              }
+                              local SUBRESOURCE_PUT = {
+                                acl = "PutBucketAcl", policy = "PutBucketPolicy", tagging = "PutBucketTagging",
+                                versioning = "PutBucketVersioning", lifecycle = "PutBucketLifecycleConfiguration",
+                                cors = "PutBucketCors", logging = "PutBucketLogging",
+                                replication = "PutBucketReplication", encryption = "PutBucketEncryption",
+                                website = "PutBucketWebsite", publicAccessBlock = "PutPublicAccessBlock",
+                              }
+                              local SUBRESOURCE_DELETE = {
+                                policy = "DeleteBucketPolicy", tagging = "DeleteBucketTagging",
+                                lifecycle = "DeleteBucketLifecycle", cors = "DeleteBucketCors",
+                                website = "DeleteBucketWebsite", replication = "DeleteBucketReplication",
+                                encryption = "DeleteBucketEncryption",
+                              }
+                              local SUBRESOURCE_NAMES = {
+                                "acl", "policy", "tagging", "versioning", "location", "lifecycle",
+                                "cors", "logging", "replication", "encryption", "website", "publicAccessBlock",
+                              }
+
+                              local function s3_action(method, host, path)
+                                local path_only, qs = path:match("^([^?]*)%??(.*)$")
+                                qs = (qs ~= "" and qs) or nil
+
+                                local bucket, key
+                                local vh_bucket = host:match("^(.+)%.s3[%.%-][^.]*%.amazonaws%.com$")
+                                  or host:match("^(.+)%.s3%.amazonaws%.com$")
+                                if vh_bucket then
+                                  bucket = vh_bucket
+                                  key = path_only:match("^/(.+)$")
+                                else
+                                  local rest = path_only:match("^/(.+)$")
+                                  if rest then
+                                    bucket, key = rest:match("^([^/]+)/(.+)$")
+                                    if not bucket then
+                                      bucket = rest:match("^([^/]+)$")
+                                    end
+                                  end
+                                end
+
+                                local subresource = nil
+                                for _, name in ipairs(SUBRESOURCE_NAMES) do
+                                  if qs_has_param(qs, name) then
+                                    subresource = name
+                                    break
+                                  end
+                                end
+
+                                if subresource and not key then
+                                  if method == "GET" and SUBRESOURCE_GET[subresource] then
+                                    return SUBRESOURCE_GET[subresource], bucket, key
+                                  end
+                                  if method == "PUT" and SUBRESOURCE_PUT[subresource] then
+                                    return SUBRESOURCE_PUT[subresource], bucket, key
+                                  end
+                                  if method == "DELETE" and SUBRESOURCE_DELETE[subresource] then
+                                    return SUBRESOURCE_DELETE[subresource], bucket, key
+                                  end
+                                end
+
+                                if method == "POST" and qs_has_param(qs, "delete") then
+                                  return "DeleteObjects", bucket, key
+                                end
+
+                                if not bucket then
+                                  if method == "GET" then
+                                    return "ListBuckets", bucket, key
+                                  end
+                                  return method .. " /", bucket, key
+                                end
+
+                                if not key then
+                                  if method == "GET" then
+                                    return "ListObjectsV2", bucket, key
+                                  end
+                                  if method == "PUT" then
+                                    return "CreateBucket", bucket, key
+                                  end
+                                  if method == "DELETE" then
+                                    return "DeleteBucket", bucket, key
+                                  end
+                                  if method == "HEAD" then
+                                    return "HeadBucket", bucket, key
+                                  end
+                                  return method .. " " .. bucket, bucket, key
+                                end
+
+                                if method == "GET" then
+                                  return "GetObject", bucket, key
+                                end
+                                if method == "PUT" then
+                                  return "PutObject", bucket, key
+                                end
+                                if method == "DELETE" then
+                                  return "DeleteObject", bucket, key
+                                end
+                                if method == "HEAD" then
+                                  return "HeadObject", bucket, key
+                                end
+                                return method .. " " .. path_only, bucket, key
+                              end
+
+                              function envoy_on_request(request_handle)
+                                local headers = request_handle:headers()
+                                local method = headers:get(":method")
+                                local path = headers:get(":path")
+                                local auth = headers:get("authorization") or ""
+                                local akid, service, region =
+                                  auth:match("Credential=([^/]+)/[^/]+/([^/]+)/([^/]+)/aws4_request")
+                                -- match() above binds in wrong order fixed below
+                                local akid2, date2, region2, service2 =
+                                  auth:match("Credential=([^/]+)/([^/]+)/([^/]+)/([^/]+)/aws4_request")
+                                akid, region, service = akid2, region2, service2
+
+                                local target = headers:get("x-amz-target")
+                                local action = nil
+                                local request_params = "null"
+                                if target then
+                                  action = target:match("%.([%w_]+)$") or target
+                                end
+
+                                if method == "POST" then
+                                  local body = request_handle:body()
+                                  if body then
+                                    local raw = body:getBytes(0, body:length())
+                                    if target then
+                                      -- JSON protocol: the body already IS
+                                      -- the request parameters, valid
+                                      -- JSON — pass through as-is rather
+                                      -- than re-encoding.
+                                      if raw and #raw > 0 then
+                                        request_params = raw:gsub('[\r\n]', ' ')
+                                      end
+                                    else
+                                      -- query protocol: Action=X&Param=Y...
+                                      action = raw:match("Action=([%w_%.]+)")
+                                      request_params = parse_query_params(raw)
+                                    end
+                                  end
+                                  -- body() can yield the coroutine, which
+                                  -- invalidates the earlier headers handle
+                                  -- ("object used outside of proper
+                                  -- scope") — must re-fetch before use.
+                                  headers = request_handle:headers()
+                                end
+
+                                if not action and service == "s3" then
+                                  local host = headers:get(":authority") or ""
+                                  local bucket, key
+                                  action, bucket, key = s3_action(method, host, path)
+                                  if bucket then
+                                    if key then
+                                      request_params = '{"BucketName":"' .. esc(bucket) .. '","Key":"' .. esc(key) .. '"}'
+                                    else
+                                      request_params = '{"BucketName":"' .. esc(bucket) .. '"}'
+                                    end
+                                  end
+                                end
+
+                                if not action then
+                                  action = (method or "?") .. " " .. (path or "?")
+                                end
+
+                                local req_id = headers:get("x-request-id") or "unknown"
+                                local user_agent = headers:get("user-agent") or "unknown"
+                                local src_ip = "unknown"
+                                local ok, addr = pcall(function()
+                                  return request_handle:streamInfo():downstreamDirectRemoteAddress()
+                                end)
+                                if ok and addr then
+                                  src_ip = addr
+                                end
+
+                                local rest =
+                                  '"eventVersion":"1.08",' ..
+                                  '"eventSource":"' .. esc(service or "unknown") .. '.amazonaws.com",' ..
+                                  '"eventName":"' .. esc(action) .. '",' ..
+                                  '"awsRegion":"' .. esc(region or "unknown") .. '",' ..
+                                  '"sourceIPAddress":"' .. esc(src_ip) .. '",' ..
+                                  '"userAgent":"' .. esc(user_agent) .. '",' ..
+                                  '"userIdentity":{"type":"IAMUser","accessKeyId":"' .. esc(akid or "unknown") ..
+                                    '","accountId":"000000000000"},' ..
+                                  '"requestID":"' .. esc(req_id) .. '",' ..
+                                  '"eventID":"' .. esc(req_id) .. '",' ..
+                                  '"eventType":"AwsApiCall",' ..
+                                  '"managementEvent":true,' ..
+                                  '"recipientAccountId":"000000000000",' ..
+                                  '"eventCategory":"Management",' ..
+                                  '"requestParameters":' .. request_params .. ',' ..
+                                  '"floci_honeypot":true'
+
+                                headers:add("x-ct-event-rest", rest)
+                              end
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                    # Real-time capture: one JSON line per request, to
+                    # stdout, as it happens — `kubectl logs -f` streams it
+                    # live. X-Amz-Target carries the actual API action for
+                    # JSON-protocol services (DynamoDB, Lambda, IAM JSON,
+                    # etc); the Authorization header's Credential=<AKID>/…
+                    # is the stolen key being used. No 60s CloudTrail
+                    # flush delay — this is the request as it crosses the
+                    # wire, before floci even processes it.
+                    access_log:
+                      - name: envoy.access_loggers.stdout
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                          log_format:
+                            # The Lua filter already built the full
+                            # CloudTrail-shaped record body (everything
+                            # except eventTime, which comes from Envoy's
+                            # own %START_TIME% since Lua's os.date isn't
+                            # guaranteed available in the sandbox) — this
+                            # just splices them together as-is. No
+                            # json_format substitution here because that
+                            # would re-escape the already-JSON header
+                            # value as a quoted string instead of nesting
+                            # it as real JSON structure.
+                            text_format_source:
+                              inline_string: "{\"eventTime\":\"%START_TIME(%Y-%m-%dT%H:%M:%SZ)%\",%REQ(X-CT-EVENT-REST)%}\n"
+                      - name: envoy.access_loggers.file
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                          path: /var/log/floci-ct/access.log
+                          log_format:
+                            text_format_source:
+                              inline_string: "{\"eventTime\":\"%START_TIME(%Y-%m-%dT%H:%M:%SZ)%\",%REQ(X-CT-EVENT-REST)%}\n"
+      clusters:
+        - name: floci
+          connect_timeout: 2s
+          type: STATIC
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: floci
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: 127.0.0.1, port_value: 4566 }
+    admin:
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: honeypot-promtail-config
+  namespace: floci-deception
+data:
+  promtail.yaml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+    positions:
+      filename: /tmp/positions.yaml
+    clients:
+      # Ships to the cluster's existing Loki, bridged over Tailscale.
+      # Connecting by IP (not the ts.net hostname) because this pod's
+      # DNS is deliberately set to public resolvers (1.1.1.1/8.8.8.8,
+      # for the decoy's anti-fingerprinting) which can't resolve
+      # Tailscale MagicDNS names — server_name below still sets the
+      # correct TLS SNI/cert-validation hostname independent of the
+      # connection address, and insecure_skip_verify sidesteps needing
+      # Tailscale's own CA in this pod's trust store.
+      - url: https://100.103.210.114/loki/api/v1/push
+        tls_config:
+          server_name: loki.tail6c68d0.ts.net
+          insecure_skip_verify: true
+    scrape_configs:
+      - job_name: floci-deception
+        static_configs:
+          - targets: [localhost]
+            labels:
+              job: floci-deception
+              cluster: timbernetes
+              # Single constant marker for "this line is a CloudTrail-
+              # shaped event" — {log_type="cloudtrail"} alone pulls every
+              # one of them. Query further with `| json` for any specific
+              # field (eventName, eventSource, userIdentity.accessKeyId,
+              # awsRegion, ...) rather than pre-promoting each to its own
+              # label.
+              log_type: cloudtrail
+              __path__: /var/log/floci-ct/access.log
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: honeypot-env-scrub
+  namespace: floci-deception
+data:
+  entrypoint.sh: |
+    #!/bin/sh
+    # Kubernetes injects KUBERNETES_SERVICE_*/KUBERNETES_PORT* for the
+    # built-in "kubernetes" service into every pod unconditionally —
+    # enableServiceLinks:false does NOT suppress it (verified: it only
+    # governs env vars for other Services in the namespace). Strip them
+    # here before the real decoy workload execs, so nothing in its
+    # environment points at the API server.
+    for v in $(env | cut -d= -f1 | grep '^KUBERNETES_'); do
+      unset "$v"
+    done
+    exec "$@"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: honeypot-docker-facade
+  namespace: floci-deception
+data:
+  # Replaces kubelet's auto-generated /etc/hosts (which starts with
+  # "# Kubernetes-managed hosts file.") with what a plain `docker run`
+  # container actually gets — no banner, hostname is the container's
+  # own short ID. The bridge IP here is cosmetic text only; the real
+  # interface still shows the actual pod CIDR address (10.244.x.x) on
+  # `ip addr` — that can't be faked without hostNetwork, which would
+  # break the netns-scoped iptables redirect this whole setup relies on.
+  hosts: |
+    127.0.0.1	localhost
+    ::1	localhost ip6-localhost ip6-loopback
+    172.17.0.5	16f4c16e35b8
+  # Docker engine (docker-shim) drops this empty marker file at container
+  # root; containerd/CRI (what this cluster actually runs) does not.
+  # Recreating it defeats the classic `[ -f /.dockerenv ] && echo docker`
+  # check scripts use.
+  dockerenv: ""
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: honeypot-iptables-setup
+  namespace: floci-deception
+data:
+  setup.sh: |
+    #!/bin/sh
+    set -eu
+    # Carve-out for the promtail sidecar's log shipping to the cluster's
+    # existing Loki (reached over Tailscale at 100.103.210.114) — this is
+    # real infrastructure traffic, not part of the AWS deception, and
+    # would otherwise get caught by the blanket 443 redirect below like
+    # everything else leaving this pod.
+    iptables -t nat -A OUTPUT -p tcp -d 100.103.210.114/32 --dport 443 -j RETURN
+    # No owner-uid exclusion needed: envoy never dials out for real (its
+    # only cluster is floci on loopback), so there's no loop to avoid.
+    iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-port 8443
+    echo "honeypot iptables rules installed"
+    iptables -t nat -L OUTPUT -n --line-numbers

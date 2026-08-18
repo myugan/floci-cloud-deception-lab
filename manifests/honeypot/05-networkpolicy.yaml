@@ -1,0 +1,41 @@
+# Backstop for when the iptables/DNS interception has a gap (sidecar
+# crash-loop, race on pod start, attacker finds a way to bind a raw
+# socket, etc). Cilium enforces this at the CNI/eBPF layer regardless of
+# what happens inside the pod's netns, so even a fully-owned decoy-app
+# container cannot reach the real internet — only loopback (floci) works.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: floci-deception-default-deny-egress
+  namespace: floci-deception
+spec:
+  endpointSelector:
+    matchLabels:
+      app: floci-deception
+  egress:
+    # DNS only, to anywhere — pod uses public resolvers (1.1.1.1/8.8.8.8)
+    # instead of cluster CoreDNS so /etc/resolv.conf doesn't leak
+    # *.svc.cluster.local search domains. Widening this to "any
+    # destination, port 53 only" is safe: the honeypot's redirect works
+    # by destination *port* (iptables REDIRECT tcp/443), not by what
+    # amazonaws.com actually resolves to — a real or fake answer both
+    # get caught the same way. Anything other than DNS is still denied.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+    # Narrow carve-out for the promtail sidecar shipping logs to the
+    # cluster's existing Loki (Tailscale-bridged at this IP). Only this
+    # one address, only 443 — everything else, including the real
+    # amazonaws.com the attacker thinks they're reaching, stays denied.
+    - toCIDR:
+        - 100.103.210.114/32
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+  # No other egress rule -> default-deny for everything else.

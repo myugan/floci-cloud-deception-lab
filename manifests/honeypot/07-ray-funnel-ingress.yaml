@@ -1,0 +1,30 @@
+# Publicly exposes the Ray dashboard (the bait) over Tailscale Funnel —
+# real internet, no VPN/tailnet membership needed to reach it, no
+# public IP or port-forward on our end either. The Tailscale Operator
+# (installed via tailscale-operator/install.sh) watches Ingress
+# resources with ingressClassName: tailscale and provisions a proxy
+# node for this automatically.
+#
+# Requires tag:k8s-operator (or whatever tag the operator's OAuth
+# client is scoped to) to actually have the "funnel" node attribute
+# granted in the tailnet's ACL policy — checked separately, not
+# something visible or settable from here.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ray-dashboard-funnel
+  namespace: floci-deception
+  annotations:
+    tailscale.com/funnel: "true"
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: ray-dashboard
+      port:
+        number: 8265
+  tls:
+    # Reads as genuine internal ML infra, not an obvious decoy —
+    # avoid names containing floci/decoy/honeypot/etc.
+    - hosts:
+        - ml-compute-01

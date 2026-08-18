@@ -1,0 +1,11 @@
+# Real secret material — regenerate instead of committing.
+# See scripts/generate-tls-secrets.sh and scripts/set-discord-webhook.sh.
+manifests/honeypot/02-ca-secret.yaml
+manifests/honeypot/03-tls-leaf-secret.yaml
+manifests/alerting/02-secret.yaml
+
+# Canary credential is also generated, not committed — see
+# scripts/generate-canary-secret.sh (no tracked file exists for it
+# already, this is just belt-and-suspenders in case one gets created
+# locally during testing).
+manifests/honeypot/01-canary-secret.yaml

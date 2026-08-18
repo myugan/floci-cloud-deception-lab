@@ -1,0 +1,8 @@
+# Runs in the management (kind-kind) cluster, not timbernetes — this is
+# where Loki actually lives (reachable at its in-cluster ClusterIP here,
+# no Tailscale bridging needed), and this cluster has normal internet
+# egress to reach Discord's API, unlike the locked-down honeypot pod.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: floci-deception-alerts
