@@ -34,10 +34,14 @@ data:
     \"User-Agent\", \"value\": f\"```{ua}```\", \"inline\": False})\n\n    return
     {\n        \"title\": title,\n        \"color\": severity_color(action),\n        \"fields\":
     fields,\n        \"footer\": {\"text\": \"floci-deception\"},\n        \"timestamp\":
-    d.get(\"eventTime\"),\n    }\n\ndef post_discord(payload: dict):\n    try:\n        r
-    = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)\n        print(f\"posted
-    to discord: status={r.status_code}\", flush=True)\n    except Exception as e:\n
-    \       print(f\"discord post failed: {e}\", flush=True)\n\n_seen_ids = set()\n_seen_order
+    d.get(\"eventTime\"),\n    }\n\ndef post_discord(payload: dict):\n    for attempt
+    in range(3):\n        try:\n            r = requests.post(DISCORD_WEBHOOK, json=payload,
+    timeout=10)\n            if r.status_code == 429:\n                wait = r.json().get(\"retry_after\",
+    1)\n                time.sleep(wait)\n                continue\n            print(f\"posted
+    to discord: status={r.status_code}\", flush=True)\n            return\n        except
+    Exception as e:\n            print(f\"discord post failed (attempt {attempt +
+    1}/3): {e}\", flush=True)\n            time.sleep(2 ** attempt)\n    print(\"discord
+    post dropped after 3 attempts\", flush=True)\n\n_seen_ids = set()\n_seen_order
     = deque()\n\ndef already_seen(event_id: str) -> bool:\n    if not event_id:\n
     \       return False\n    if event_id in _seen_ids:\n        return True\n    _seen_ids.add(event_id)\n
     \   _seen_order.append(event_id)\n    if len(_seen_order) > SEEN_MAX:\n        old

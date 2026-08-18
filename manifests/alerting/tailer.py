@@ -83,11 +83,19 @@ def format_embed(d: dict) -> dict:
     }
 
 def post_discord(payload: dict):
-    try:
-        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-        print(f"posted to discord: status={r.status_code}", flush=True)
-    except Exception as e:
-        print(f"discord post failed: {e}", flush=True)
+    for attempt in range(3):
+        try:
+            r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+            if r.status_code == 429:
+                wait = r.json().get("retry_after", 1)
+                time.sleep(wait)
+                continue
+            print(f"posted to discord: status={r.status_code}", flush=True)
+            return
+        except Exception as e:
+            print(f"discord post failed (attempt {attempt + 1}/3): {e}", flush=True)
+            time.sleep(2 ** attempt)
+    print("discord post dropped after 3 attempts", flush=True)
 
 _seen_ids = set()
 _seen_order = deque()
