@@ -8,6 +8,39 @@ queryable via LogQL, and posted to Discord in real time.
 
 **Status: live** at `https://ml-compute-01.tail6c68d0.ts.net`.
 
+## Architecture
+
+```
+Internet ──> Funnel (ml-compute-01.tail6c68d0.ts.net)
+              │  public HTTPS, no raw IP:8265 exposed
+              ▼
+      tailscale proxy pod ──> Service ──> honeypot pod
+                                          (timbernetes)
+┌─────────────────────────────────────────────────────┐
+│ decoy-app (Ray)  ── unauth RCE, reads canary AWS     │
+│   │  creds, calls boto3 with no --endpoint-url        │
+│   ▼                                                   │
+│ iptables REDIRECT tcp/443 -> envoy-sidecar:8443       │
+│   │  TLS terminate (our CA) + Lua: derive service/    │
+│   │  region/action, build CloudTrail JSON             │
+│   ▼                                                   │
+│ floci:4566  ── answers as if real AWS                 │
+│   │                                                    │
+│ promtail  ── ships CloudTrail log out                 │
+└──────────────────────┬────────────────────────────────┘
+   Cilium: default-deny egress except DNS + Loki IP
+                        │
+                        ▼
+      Loki (log_type=cloudtrail)
+                        │
+                        ▼
+      discord-alert-tailer ── tails Loki, batches bursts,
+                               colors by severity
+                        │
+                        ▼
+                    Discord channel
+```
+
 ## The bait
 
 `decoy-app` runs `rayproject/ray:2.9.0-py311`, vulnerable to the
@@ -119,15 +152,3 @@ Shipped to the cluster's existing Loki, tagged `log_type=cloudtrail`:
 ```logql
 {log_type="cloudtrail"} | json | eventName="CreateUser"
 ```
-
-## Known gaps
-
-- Tailscale Operator in `timbernetes` reuses the management cluster's
-  OAuth client rather than a cluster-scoped one — if `timbernetes` is
-  compromised beyond the honeypot pod, that credential is exposed too.
-- gVisor/sandboxing for `decoy-app`: not done — needs node-level
-  containerd changes on a cluster that hosts other workloads too.
-- `/proc/*/cgroup`, `/proc/mounts`, and the real pod-CIDR `ip addr`
-  still reveal Kubernetes — unfixable from a pod manifest.
-- floci's storage is memory-only — a pod restart wipes emulated AWS
-  state. The activity log (Loki/Discord) is unaffected.
