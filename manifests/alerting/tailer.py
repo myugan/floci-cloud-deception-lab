@@ -58,9 +58,8 @@ def format_embed(d: dict) -> dict:
     if len(ua) > 200:
         ua = ua[:200] + "…"
 
-    service_short = d.get("eventSource", "?").split(".")[0]
     action = d.get("eventName", "?")
-    title = f"🚨 {service_short}:{action} — canary key triggered"
+    title = "🚨 Canary key triggered"
 
     fields = [
         {"name": "Service", "value": f"`{d.get('eventSource', '?')}`", "inline": True},

@@ -23,39 +23,38 @@ data:
     \   if _INFO_RE.match(event_name):\n        return COLOR_INFO\n    return COLOR_WARNING\n\ndef
     _truncate(s: str, limit: int) -> str:\n    return s if len(s) <= limit else s[:
     limit - 1] + \"…\"\n\ndef format_embed(d: dict) -> dict:\n    ua = d.get(\"userAgent\",
-    \"?\")\n    if len(ua) > 200:\n        ua = ua[:200] + \"…\"\n\n    service_short
-    = d.get(\"eventSource\", \"?\").split(\".\")[0]\n    action = d.get(\"eventName\",
-    \"?\")\n    title = f\"\U0001F6A8 {service_short}:{action} — canary key triggered\"\n\n
-    \   fields = [\n        {\"name\": \"Service\", \"value\": f\"`{d.get('eventSource',
-    '?')}`\", \"inline\": True},\n        {\"name\": \"Action\", \"value\": f\"**{action}**\",
-    \"inline\": True},\n        {\"name\": \"Region\", \"value\": f\"`{d.get('awsRegion',
-    '?')}`\", \"inline\": True},\n    ]\n\n    params = d.get(\"requestParameters\")\n
-    \   if params:\n        params_str = _truncate(json.dumps(params), 1000)\n        fields.append({\"name\":
-    \"Parameters\", \"value\": f\"```json\\n{params_str}\\n```\", \"inline\": False})\n\n
-    \   fields.append({\"name\": \"User-Agent\", \"value\": f\"```{ua}```\", \"inline\":
-    False})\n\n    return {\n        \"title\": title,\n        \"color\": severity_color(action),\n
-    \       \"fields\": fields,\n        \"footer\": {\"text\": \"floci-deception\"},\n
-    \       \"timestamp\": d.get(\"eventTime\"),\n    }\n\ndef post_discord(payload:
-    dict):\n    try:\n        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)\n
-    \       print(f\"posted to discord: status={r.status_code}\", flush=True)\n    except
-    Exception as e:\n        print(f\"discord post failed: {e}\", flush=True)\n\n_seen_ids
-    = set()\n_seen_order = deque()\n\ndef already_seen(event_id: str) -> bool:\n    if
-    not event_id:\n        return False\n    if event_id in _seen_ids:\n        return
-    True\n    _seen_ids.add(event_id)\n    _seen_order.append(event_id)\n    if len(_seen_order)
-    > SEEN_MAX:\n        old = _seen_order.popleft()\n        _seen_ids.discard(old)\n
-    \   return False\n\ndef on_message(ws, message):\n    data = json.loads(message)\n
-    \   for stream in data.get(\"streams\", []):\n        for _ts, line in stream.get(\"values\",
-    []):\n            try:\n                event = json.loads(line)\n            except
-    Exception:\n                post_discord({\"content\": f\"cloudtrail activity
-    (unparsed): {line[:200]}\"})\n                continue\n            if already_seen(event.get(\"requestID\")):\n
-    \               continue\n            post_discord({\"embeds\": [format_embed(event)]})\n\ndef
-    on_error(ws, error):\n    print(f\"ws error: {error}\", flush=True)\n\ndef on_close(ws,
-    *_a):\n    print(\"ws closed\", flush=True)\n\ndef on_open(ws):\n    print(f\"ws
-    connected: {LOKI_WS}\", flush=True)\n\ndef main():\n    while True:\n        ws
-    = websocket.WebSocketApp(\n            LOKI_WS,\n            on_open=on_open,\n
-    \           on_message=on_message,\n            on_error=on_error,\n            on_close=on_close,\n
-    \       )\n        ws.run_forever()\n        print(\"reconnecting in 5s\", flush=True)\n
-    \       time.sleep(5)\n\nif __name__ == \"__main__\":\n    main()\n"
+    \"?\")\n    if len(ua) > 200:\n        ua = ua[:200] + \"…\"\n\n    action = d.get(\"eventName\",
+    \"?\")\n    title = \"\U0001F6A8 Canary key triggered\"\n\n    fields = [\n        {\"name\":
+    \"Service\", \"value\": f\"`{d.get('eventSource', '?')}`\", \"inline\": True},\n
+    \       {\"name\": \"Action\", \"value\": f\"**{action}**\", \"inline\": True},\n
+    \       {\"name\": \"Region\", \"value\": f\"`{d.get('awsRegion', '?')}`\", \"inline\":
+    True},\n    ]\n\n    params = d.get(\"requestParameters\")\n    if params:\n        params_str
+    = _truncate(json.dumps(params), 1000)\n        fields.append({\"name\": \"Parameters\",
+    \"value\": f\"```json\\n{params_str}\\n```\", \"inline\": False})\n\n    fields.append({\"name\":
+    \"User-Agent\", \"value\": f\"```{ua}```\", \"inline\": False})\n\n    return
+    {\n        \"title\": title,\n        \"color\": severity_color(action),\n        \"fields\":
+    fields,\n        \"footer\": {\"text\": \"floci-deception\"},\n        \"timestamp\":
+    d.get(\"eventTime\"),\n    }\n\ndef post_discord(payload: dict):\n    try:\n        r
+    = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)\n        print(f\"posted
+    to discord: status={r.status_code}\", flush=True)\n    except Exception as e:\n
+    \       print(f\"discord post failed: {e}\", flush=True)\n\n_seen_ids = set()\n_seen_order
+    = deque()\n\ndef already_seen(event_id: str) -> bool:\n    if not event_id:\n
+    \       return False\n    if event_id in _seen_ids:\n        return True\n    _seen_ids.add(event_id)\n
+    \   _seen_order.append(event_id)\n    if len(_seen_order) > SEEN_MAX:\n        old
+    = _seen_order.popleft()\n        _seen_ids.discard(old)\n    return False\n\ndef
+    on_message(ws, message):\n    data = json.loads(message)\n    for stream in data.get(\"streams\",
+    []):\n        for _ts, line in stream.get(\"values\", []):\n            try:\n
+    \               event = json.loads(line)\n            except Exception:\n                post_discord({\"content\":
+    f\"cloudtrail activity (unparsed): {line[:200]}\"})\n                continue\n
+    \           if already_seen(event.get(\"requestID\")):\n                continue\n
+    \           post_discord({\"embeds\": [format_embed(event)]})\n\ndef on_error(ws,
+    error):\n    print(f\"ws error: {error}\", flush=True)\n\ndef on_close(ws, *_a):\n
+    \   print(\"ws closed\", flush=True)\n\ndef on_open(ws):\n    print(f\"ws connected:
+    {LOKI_WS}\", flush=True)\n\ndef main():\n    while True:\n        ws = websocket.WebSocketApp(\n
+    \           LOKI_WS,\n            on_open=on_open,\n            on_message=on_message,\n
+    \           on_error=on_error,\n            on_close=on_close,\n        )\n        ws.run_forever()\n
+    \       print(\"reconnecting in 5s\", flush=True)\n        time.sleep(5)\n\nif
+    __name__ == \"__main__\":\n    main()\n"
 kind: ConfigMap
 metadata:
   name: discord-alert-tailer-script
