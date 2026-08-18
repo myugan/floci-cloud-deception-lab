@@ -11,35 +11,56 @@ queryable via LogQL, and posted to Discord in real time.
 ## Architecture
 
 ```
-Internet ──> Funnel (ml-compute-01.tail6c68d0.ts.net)
-              │  public HTTPS, no raw IP:8265 exposed
-              ▼
-      tailscale proxy pod ──> Service ──> honeypot pod
-                                          (timbernetes)
-┌─────────────────────────────────────────────────────┐
-│ decoy-app (Ray)  ── unauth RCE, reads canary AWS     │
-│   │  creds, calls boto3 with no --endpoint-url        │
-│   ▼                                                   │
-│ iptables REDIRECT tcp/443 -> envoy-sidecar:8443       │
-│   │  TLS terminate (our CA) + Lua: derive service/    │
-│   │  region/action, build CloudTrail JSON             │
-│   ▼                                                   │
-│ floci:4566  ── answers as if real AWS                 │
-│   │                                                    │
-│ promtail  ── ships CloudTrail log out                 │
-└──────────────────────┬────────────────────────────────┘
-   Cilium: default-deny egress except DNS + Loki IP
-                        │
-                        ▼
-      Loki (log_type=cloudtrail)
-                        │
-                        ▼
-      discord-alert-tailer ── tails Loki, batches bursts,
-                               colors by severity
-                        │
-                        ▼
-                    Discord channel
+        attacker (internet)
+                │
+                ▼
+     ┌─────────────────────┐
+     │  Tailscale Funnel    │  public HTTPS endpoint
+     └──────────┬───────────┘
+                ▼
+     ┌─────────────────────┐
+     │  Ray dashboard       │  no auth, runs a shell
+     │  (decoy-app)         │  command as a "job"
+     └──────────┬───────────┘
+                ▼
+     ┌─────────────────────┐
+     │  canary AWS key      │  job reads it from env,
+     │  in the environment  │  calls boto3 normally
+     └──────────┬───────────┘
+                ▼
+     ┌─────────────────────┐
+     │  iptables redirect   │  tcp/443 -> loopback,
+     │                      │  no --endpoint-url needed
+     └──────────┬───────────┘
+                ▼
+     ┌─────────────────────┐
+     │  envoy + Lua filter  │  decrypts TLS, works out
+     │                      │  which AWS action it was
+     └──────────┬───────────┘
+                ▼
+     ┌─────────────────────┐
+     │  floci               │  fake AWS, answers back
+     └──────────┬───────────┘
+                ▼
+     ┌─────────────────────┐
+     │  promtail            │  ships the log out
+     └──────────┬───────────┘
+                ▼
+     ┌─────────────────────┐
+     │  Loki                │  log_type=cloudtrail
+     └──────────┬───────────┘
+                ▼
+     ┌─────────────────────┐
+     │  discord-alert-tailer│  batches bursts, colors
+     │                      │  by severity
+     └──────────┬───────────┘
+                ▼
+          Discord channel
 ```
+
+Everything from the Ray dashboard down runs inside one pod, sharing one
+network namespace, locked down by a default-deny egress policy (only
+DNS and the Loki path are allowed out).
 
 ## The bait
 
