@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: honeypot-liveness
+  namespace: floci-deception-alerts
+  labels:
+    app: honeypot-liveness
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: honeypot-liveness
+  template:
+    metadata:
+      labels:
+        app: honeypot-liveness
+    spec:
+      containers:
+        - name: liveness
+          image: python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - pip install --no-cache-dir --quiet requests && exec python /app/liveness-check.py
+          env:
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: discord-webhook
+                  key: url
+          volumeMounts:
+            - name: script
+              mountPath: /app
+      volumes:
+        - name: script
+          configMap:
+            name: honeypot-liveness-script
