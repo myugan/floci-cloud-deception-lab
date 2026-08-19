@@ -52,8 +52,10 @@ data:
                     http_filters: &shared_http_filters
                       # Builds a real AWS CloudTrail-shaped event record —
                       # same field names or the actual thing (eventSource,
-                      # eventName, userIdentity, awsRegion, sourceIPAddress,
-                      # userAgent, requestID) — so this reads like, and can
+                      # eventName, userIdentity, awsRegion, userAgent,
+                      # requestID; sourceIPAddress comes from Envoy's own
+                      # access-log formatter instead, see below) — so this
+                      # reads like, and can
                       # be parsed by, tooling that already expects
                       # CloudTrail JSON. floci's own CloudTrail emulation
                       # doesn't actually populate lookup-events (tested:
@@ -358,13 +360,6 @@ data:
 
                                 local req_id = headers:get("x-request-id") or "unknown"
                                 local user_agent = headers:get("user-agent") or "unknown"
-                                local src_ip = "unknown"
-                                local ok, addr = pcall(function()
-                                  return request_handle:streamInfo():downstreamDirectRemoteAddress()
-                                end)
-                                if ok and addr then
-                                  src_ip = addr
-                                end
 
                                 -- ASIA-prefixed keys are STS temporary
                                 -- credentials (AssumeRole and friends);
@@ -383,7 +378,6 @@ data:
                                   '"eventSource":"' .. esc(service or "unknown") .. '.amazonaws.com",' ..
                                   '"eventName":"' .. esc(action) .. '",' ..
                                   '"awsRegion":"' .. esc(region or "unknown") .. '",' ..
-                                  '"sourceIPAddress":"' .. esc(src_ip) .. '",' ..
                                   '"userAgent":"' .. esc(user_agent) .. '",' ..
                                   '"userIdentity":{"type":"' .. identity_type .. '","accessKeyId":"' .. esc(akid or "unknown") ..
                                     '","accountId":"' .. FAKE_ACCOUNT_ID .. '"},' ..
@@ -439,23 +433,30 @@ data:
                           log_format:
                             # The Lua filter already built the full
                             # CloudTrail-shaped record body (everything
-                            # except eventTime, which comes from Envoy's
-                            # own %START_TIME% since Lua's os.date isn't
-                            # guaranteed available in the sandbox) — this
-                            # just splices them together as-is. No
+                            # except eventTime and sourceIPAddress, which
+                            # come from Envoy's own access-log formatters
+                            # instead of Lua's sandbox APIs -- os.date
+                            # isn't guaranteed available there, and
+                            # streamInfo():downstreamDirectRemoteAddress()
+                            # was seen failing outright on at least one
+                            # real deployment, every call, not just some;
+                            # %DOWNSTREAM_REMOTE_ADDRESS% is the same
+                            # battle-tested mechanism virtually every Envoy
+                            # deployment already relies on for this) —
+                            # this just splices them together as-is. No
                             # json_format substitution here because that
                             # would re-escape the already-JSON header
                             # value as a quoted string instead of nesting
                             # it as real JSON structure.
                             text_format_source:
-                              inline_string: "{\"eventTime\":\"%START_TIME(%Y-%m-%dT%H:%M:%SZ)%\",%REQ(X-CT-EVENT-REST)%}\n"
+                              inline_string: "{\"eventTime\":\"%START_TIME(%Y-%m-%dT%H:%M:%SZ)%\",\"sourceIPAddress\":\"%DOWNSTREAM_REMOTE_ADDRESS%\",%REQ(X-CT-EVENT-REST)%}\n"
                       - name: envoy.access_loggers.file
                         typed_config:
                           "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
                           path: /var/log/floci-ct/access.log
                           log_format:
                             text_format_source:
-                              inline_string: "{\"eventTime\":\"%START_TIME(%Y-%m-%dT%H:%M:%SZ)%\",%REQ(X-CT-EVENT-REST)%}\n"
+                              inline_string: "{\"eventTime\":\"%START_TIME(%Y-%m-%dT%H:%M:%SZ)%\",\"sourceIPAddress\":\"%DOWNSTREAM_REMOTE_ADDRESS%\",%REQ(X-CT-EVENT-REST)%}\n"
         # Catches direct :4566 calls that skip the normal 443 path
         # (e.g. localhost port-scan post-RCE). Same Lua/access_log,
         # no TLS since the traffic is already plain HTTP.
@@ -569,7 +570,6 @@ data:
                                   '"eventSource":"imds.internal",' ..
                                   '"eventName":"' .. esc(event) .. '",' ..
                                   '"awsRegion":"us-east-1",' ..
-                                  '"sourceIPAddress":"unknown",' ..
                                   '"userAgent":"' .. esc(headers:get("user-agent") or "unknown") .. '",' ..
                                   '"userIdentity":{"type":"IAMUser","accessKeyId":"unknown","accountId":"' .. FAKE_ACCOUNT_ID .. '"},' ..
                                   '"requestID":"' .. esc(req_id) .. '",' ..
