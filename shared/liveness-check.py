@@ -22,6 +22,10 @@ import requests
 from discord_alerting import post_discord
 
 URL = os.environ["HONEYPOT_URL"]
+if not URL:
+    # Compose's optional alerting profile passes this through as an
+    # empty string when .env isn't set, rather than leaving it unset.
+    raise RuntimeError("HONEYPOT_URL is empty -- set it in .env")
 CHECK_INTERVAL_SECONDS = 60
 FAILURES_BEFORE_ALERT = 2
 

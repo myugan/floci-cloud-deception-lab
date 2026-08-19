@@ -157,7 +157,7 @@ services:
       envoy:
         condition: service_started
     environment:
-      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:?set DISCORD_WEBHOOK_URL in .env}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
     volumes:
       - ../shared/file-tailer.py:/app/file-tailer.py:ro
       - ../shared/discord_alerting.py:/app/discord_alerting.py:ro
@@ -169,8 +169,8 @@ services:
     restart: unless-stopped
     profiles: ["alerting"]
     environment:
-      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:?set DISCORD_WEBHOOK_URL in .env}
-      HONEYPOT_URL: ${HONEYPOT_URL:?set HONEYPOT_URL in .env -- your droplet's public URL}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      HONEYPOT_URL: ${HONEYPOT_URL:-}
     volumes:
       - ../shared/liveness-check.py:/app/liveness-check.py:ro
       - ../shared/discord_alerting.py:/app/discord_alerting.py:ro

@@ -30,6 +30,12 @@ from collections import deque
 import requests
 
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
+if not DISCORD_WEBHOOK:
+    # Kubernetes leaves this genuinely unset if misconfigured (a clear
+    # KeyError above). Compose's optional profile passes it through as
+    # an empty string when .env isn't set, which would otherwise fail
+    # opaquely inside requests.post() instead of here.
+    raise RuntimeError("DISCORD_WEBHOOK_URL is empty -- set it in .env")
 
 SEEN_MAX = 500
 
