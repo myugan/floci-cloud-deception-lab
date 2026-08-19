@@ -1,0 +1,581 @@
+# Terminates the redirected TLS traffic with a static *.amazonaws.com
+# leaf cert (signed by our CA) and forwards every request, headers
+# untouched, to floci over plain HTTP on loopback. floci's edge router
+# dispatches by parsing the SigV4 Authorization header's
+# Credential=.../<region>/<service>/... scope, not by Host, so leaving
+# Host/Authorization exactly as the client signed them still routes
+# correctly — and floci's own access log captures the real (stolen)
+# access key + intended service/action verbatim for forensics.
+#
+# Orchestrator-agnostic: this file is the single source of truth for
+# both the Kubernetes deployment (manifests/) and the Docker Compose
+# deployment (compose/) -- identical Lua, identical listeners, no
+# forked copies to keep in sync.
+static_resources:
+  listeners:
+    - name: aws_intercept
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8443 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: "/certs/leaf-cert.pem" }
+                    private_key: { filename: "/certs/leaf-key.pem" }
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: aws_intercept
+                # Connection: close avoids a keep-alive framing bug
+                # seen here (Lua's body() + reused plain-HTTP
+                # connection eventually corrupts into duplicate/
+                # malformed requests, since floci's upstream leg is
+                # plain HTTP even though the client leg is TLS) --
+                # same fix already applied on direct_floci_intercept.
+                route_config:
+                  name: local_route
+                  response_headers_to_add:
+                    - header: { key: "Connection", value: "close" }
+                  virtual_hosts:
+                    - name: floci
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: floci, timeout: 30s }
+                http_filters: &shared_http_filters
+                  # Builds a real AWS CloudTrail-shaped event record —
+                  # same field names or the actual thing (eventSource,
+                  # eventName, userIdentity, awsRegion, sourceIPAddress,
+                  # userAgent, requestID) — so this reads like, and can
+                  # be parsed by, tooling that already expects
+                  # CloudTrail JSON. floci's own CloudTrail emulation
+                  # doesn't actually populate lookup-events (tested:
+                  # always returns empty, even after real write
+                  # actions), so this is what stands in for it.
+                  #
+                  # - eventSource/eventName: service comes from the
+                  #   Authorization header's Credential=.../<region>/
+                  #   <service>/... scope (always present, SigV4
+                  #   requires it); action comes from X-Amz-Target
+                  #   (JSON-protocol services) or the POST body's
+                  #   Action=X (STS/IAM/EC2 "query protocol"); S3 has
+                  #   neither (REST-shaped) so falls back to
+                  #   "METHOD /path".
+                  # - userIdentity.accessKeyId: the actual stolen key
+                  #   in use, straight from the same Credential scope.
+                  # - requestID/eventID: reuses Envoy's own
+                  #   x-request-id (real CloudTrail has these as two
+                  #   distinct UUIDs; this is a simplification).
+                  # - requestParameters: for query-protocol calls
+                  #   (STS/IAM/EC2), the POST body's key=value pairs
+                  #   minus Action/Version (e.g. CreateUser's
+                  #   UserName); for JSON-protocol calls (DynamoDB,
+                  #   Lambda) the body IS already the parameters, so
+                  #   it's passed through as-is. Not populated for
+                  #   REST-shaped services (S3) — no single params
+                  #   blob there, and request bodies can be raw file
+                  #   data anyway.
+                  # - responseElements/errorCode: NOT populated —
+                  #   errorCode never applies anyway since floci
+                  #   doesn't enforce IAM (nothing is ever denied) —
+                  #   known, deliberate gap.
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          local function esc(s)
+                            return tostring(s):gsub('[\r\n]', ' '):gsub('\\', '\\\\'):gsub('"', '\\"')
+                          end
+
+                          local function url_decode(s)
+                            s = s:gsub('+', ' ')
+                            s = s:gsub('%%(%x%x)', function(h)
+                              return string.char(tonumber(h, 16))
+                            end)
+                            return s
+                          end
+
+                          -- Query-protocol body (Action=X&UserName=Y&...) minus
+                          -- Action/Version -> a small JSON object, e.g. CreateUser's
+                          -- {"UserName":"foo"}. Truncated defensively so a huge body
+                          -- can't blow header size limits or Discord's field limits.
+                          local function parse_query_params(raw)
+                            local parts = {}
+                            for pair in raw:gmatch('[^&]+') do
+                              local k, v = pair:match('([^=]+)=?(.*)')
+                              if k then
+                                k = url_decode(k)
+                                if k ~= "Action" and k ~= "Version" then
+                                  table.insert(parts, '"' .. esc(k) .. '":"' .. esc(url_decode(v or "")) .. '"')
+                                end
+                              end
+                            end
+                            if #parts == 0 then
+                              return "null"
+                            end
+                            -- Left as valid JSON always (no naive
+                            -- string truncation here — cutting mid-
+                            -- object would break the JSON). Display-
+                            -- side truncation (Discord field limits
+                            -- etc.) happens downstream instead.
+                            return "{" .. table.concat(parts, ",") .. "}"
+                          end
+
+                          -- S3 is REST-shaped: there's no Action= param or
+                          -- X-Amz-Target, so real CloudTrail infers the
+                          -- eventName from method + bucket/key presence +
+                          -- subresource query params (?acl, ?policy, ...).
+                          -- Covers the common bucket/object CRUD + the
+                          -- usual subresources; deliberately not
+                          -- exhaustive (multipart upload steps, SELECT,
+                          -- etc. aren't covered — falls back to
+                          -- "METHOD /path" same as before for those).
+                          local function qs_has_param(qs, name)
+                            if not qs then
+                              return false
+                            end
+                            for pair in qs:gmatch('[^&]+') do
+                              if pair:match('^([^=]+)') == name then
+                                return true
+                              end
+                            end
+                            return false
+                          end
+
+                          local SUBRESOURCE_GET = {
+                            acl = "GetBucketAcl", policy = "GetBucketPolicy", tagging = "GetBucketTagging",
+                            versioning = "GetBucketVersioning", location = "GetBucketLocation",
+                            lifecycle = "GetBucketLifecycleConfiguration", cors = "GetBucketCors",
+                            logging = "GetBucketLogging", replication = "GetBucketReplication",
+                            encryption = "GetBucketEncryption", website = "GetBucketWebsite",
+                            publicAccessBlock = "GetPublicAccessBlock",
+                          }
+                          local SUBRESOURCE_PUT = {
+                            acl = "PutBucketAcl", policy = "PutBucketPolicy", tagging = "PutBucketTagging",
+                            versioning = "PutBucketVersioning", lifecycle = "PutBucketLifecycleConfiguration",
+                            cors = "PutBucketCors", logging = "PutBucketLogging",
+                            replication = "PutBucketReplication", encryption = "PutBucketEncryption",
+                            website = "PutBucketWebsite", publicAccessBlock = "PutPublicAccessBlock",
+                          }
+                          local SUBRESOURCE_DELETE = {
+                            policy = "DeleteBucketPolicy", tagging = "DeleteBucketTagging",
+                            lifecycle = "DeleteBucketLifecycle", cors = "DeleteBucketCors",
+                            website = "DeleteBucketWebsite", replication = "DeleteBucketReplication",
+                            encryption = "DeleteBucketEncryption",
+                          }
+                          local SUBRESOURCE_NAMES = {
+                            "acl", "policy", "tagging", "versioning", "location", "lifecycle",
+                            "cors", "logging", "replication", "encryption", "website", "publicAccessBlock",
+                          }
+
+                          local function s3_action(method, host, path)
+                            local path_only, qs = path:match("^([^?]*)%??(.*)$")
+                            qs = (qs ~= "" and qs) or nil
+
+                            local bucket, key
+                            local vh_bucket = host:match("^(.+)%.s3[%.%-][^.]*%.amazonaws%.com$")
+                              or host:match("^(.+)%.s3%.amazonaws%.com$")
+                            if vh_bucket then
+                              bucket = vh_bucket
+                              key = path_only:match("^/(.+)$")
+                            else
+                              local rest = path_only:match("^/(.+)$")
+                              if rest then
+                                bucket, key = rest:match("^([^/]+)/(.+)$")
+                                if not bucket then
+                                  bucket = rest:match("^([^/]+)$")
+                                end
+                              end
+                            end
+
+                            local subresource = nil
+                            for _, name in ipairs(SUBRESOURCE_NAMES) do
+                              if qs_has_param(qs, name) then
+                                subresource = name
+                                break
+                              end
+                            end
+
+                            if subresource and not key then
+                              if method == "GET" and SUBRESOURCE_GET[subresource] then
+                                return SUBRESOURCE_GET[subresource], bucket, key
+                              end
+                              if method == "PUT" and SUBRESOURCE_PUT[subresource] then
+                                return SUBRESOURCE_PUT[subresource], bucket, key
+                              end
+                              if method == "DELETE" and SUBRESOURCE_DELETE[subresource] then
+                                return SUBRESOURCE_DELETE[subresource], bucket, key
+                              end
+                            end
+
+                            if method == "POST" and qs_has_param(qs, "delete") then
+                              return "DeleteObjects", bucket, key
+                            end
+
+                            if not bucket then
+                              if method == "GET" then
+                                return "ListBuckets", bucket, key
+                              end
+                              return method .. " /", bucket, key
+                            end
+
+                            if not key then
+                              if method == "GET" then
+                                return "ListObjectsV2", bucket, key
+                              end
+                              if method == "PUT" then
+                                return "CreateBucket", bucket, key
+                              end
+                              if method == "DELETE" then
+                                return "DeleteBucket", bucket, key
+                              end
+                              if method == "HEAD" then
+                                return "HeadBucket", bucket, key
+                              end
+                              return method .. " " .. bucket, bucket, key
+                            end
+
+                            if method == "GET" then
+                              return "GetObject", bucket, key
+                            end
+                            if method == "PUT" then
+                              return "PutObject", bucket, key
+                            end
+                            if method == "DELETE" then
+                              return "DeleteObject", bucket, key
+                            end
+                            if method == "HEAD" then
+                              return "HeadObject", bucket, key
+                            end
+                            return method .. " " .. path_only, bucket, key
+                          end
+
+                          -- Fallback for REST services other than S3
+                          -- (Route53, CloudFront, IoT-data, ...).
+                          -- Not exact CloudTrail casing/pluralization,
+                          -- but far better than raw "METHOD /path".
+                          local function generic_rest_action(method, path)
+                            local p = (path:match("^([^?]*)") or path)
+                              :gsub("^/v?%d[%d%-%.]*/", "/")
+                            local segments = {}
+                            for seg in p:gmatch("[^/]+") do
+                              table.insert(segments, seg)
+                            end
+                            if #segments == 0 then
+                              return method .. " /"
+                            end
+                            local resource = segments[1]
+                            local has_id = #segments >= 2
+                            local singular = resource:gsub("ies$", "y"):gsub("s$", "")
+                            local noun = has_id and singular or resource
+                            noun = noun:sub(1, 1):upper() .. noun:sub(2)
+                            local verbs = {
+                              GET = has_id and "Get" or "List",
+                              POST = "Create",
+                              PUT = has_id and "Update" or "Put",
+                              PATCH = "Update",
+                              DELETE = "Delete",
+                            }
+                            return (verbs[method] or method) .. noun
+                          end
+
+                          function envoy_on_request(request_handle)
+                            local headers = request_handle:headers()
+                            local method = headers:get(":method")
+                            local path = headers:get(":path")
+                            local auth = headers:get("authorization") or ""
+                            local akid, _date, region, service =
+                              auth:match("Credential=([^/]+)/([^/]+)/([^/]+)/([^/]+)/aws4_request")
+
+                            local target = headers:get("x-amz-target")
+                            local action = nil
+                            local request_params = "null"
+                            if target then
+                              action = target:match("%.([%w_]+)$") or target
+                            end
+
+                            if method == "POST" then
+                              local body = request_handle:body()
+                              if body then
+                                local raw = body:getBytes(0, body:length())
+                                if target then
+                                  -- JSON protocol: the body already IS
+                                  -- the request parameters, valid
+                                  -- JSON — pass through as-is rather
+                                  -- than re-encoding.
+                                  if raw and #raw > 0 then
+                                    request_params = raw:gsub('[\r\n]', ' ')
+                                  end
+                                else
+                                  -- query protocol: Action=X&Param=Y...
+                                  action = raw:match("Action=([%w_%.]+)")
+                                  request_params = parse_query_params(raw)
+                                end
+                              end
+                              -- body() can yield the coroutine, which
+                              -- invalidates the earlier headers handle
+                              -- ("object used outside of proper
+                              -- scope") — must re-fetch before use.
+                              headers = request_handle:headers()
+                            end
+
+                            if not action and service == "s3" then
+                              local host = headers:get(":authority") or ""
+                              local bucket, key
+                              action, bucket, key = s3_action(method, host, path)
+                              if bucket then
+                                if key then
+                                  request_params = '{"BucketName":"' .. esc(bucket) .. '","Key":"' .. esc(key) .. '"}'
+                                else
+                                  request_params = '{"BucketName":"' .. esc(bucket) .. '"}'
+                                end
+                              end
+                            end
+
+                            if not action then
+                              action = generic_rest_action(method, path)
+                            end
+
+                            local req_id = headers:get("x-request-id") or "unknown"
+                            local user_agent = headers:get("user-agent") or "unknown"
+                            local src_ip = "unknown"
+                            local ok, addr = pcall(function()
+                              return request_handle:streamInfo():downstreamDirectRemoteAddress()
+                            end)
+                            if ok and addr then
+                              src_ip = addr
+                            end
+
+                            local rest =
+                              '"eventVersion":"1.08",' ..
+                              '"eventSource":"' .. esc(service or "unknown") .. '.amazonaws.com",' ..
+                              '"eventName":"' .. esc(action) .. '",' ..
+                              '"awsRegion":"' .. esc(region or "unknown") .. '",' ..
+                              '"sourceIPAddress":"' .. esc(src_ip) .. '",' ..
+                              '"userAgent":"' .. esc(user_agent) .. '",' ..
+                              '"userIdentity":{"type":"IAMUser","accessKeyId":"' .. esc(akid or "unknown") ..
+                                '","accountId":"000000000000"},' ..
+                              '"requestID":"' .. esc(req_id) .. '",' ..
+                              '"eventID":"' .. esc(req_id) .. '",' ..
+                              '"eventType":"AwsApiCall",' ..
+                              '"managementEvent":true,' ..
+                              '"recipientAccountId":"000000000000",' ..
+                              '"eventCategory":"Management",' ..
+                              '"requestParameters":' .. request_params .. ',' ..
+                              '"floci_honeypot":true'
+
+                            -- replace, not add: if this callback
+                            -- ever fires twice for one request (seen
+                            -- during a retry storm), add() would
+                            -- leave two header values, which
+                            -- %REQ(...)% joins into broken JSON.
+                            headers:replace("x-ct-event-rest", rest)
+                          end
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                # Real-time capture: one JSON line per request, to
+                # stdout, as it happens — `docker compose logs -f` /
+                # `kubectl logs -f` streams it live. X-Amz-Target
+                # carries the actual API action for JSON-protocol
+                # services (DynamoDB, Lambda, IAM JSON, etc); the
+                # Authorization header's Credential=<AKID>/… is the
+                # stolen key being used. No 60s CloudTrail flush delay
+                # — this is the request as it crosses the wire, before
+                # floci even processes it.
+                access_log: &shared_access_log
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        # The Lua filter already built the full
+                        # CloudTrail-shaped record body (everything
+                        # except eventTime, which comes from Envoy's
+                        # own %START_TIME% since Lua's os.date isn't
+                        # guaranteed available in the sandbox) — this
+                        # just splices them together as-is. No
+                        # json_format substitution here because that
+                        # would re-escape the already-JSON header
+                        # value as a quoted string instead of nesting
+                        # it as real JSON structure.
+                        text_format_source:
+                          inline_string: "{\"eventTime\":\"%START_TIME(%Y-%m-%dT%H:%M:%SZ)%\",%REQ(X-CT-EVENT-REST)%}\n"
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /var/log/floci-ct/access.log
+                      log_format:
+                        text_format_source:
+                          inline_string: "{\"eventTime\":\"%START_TIME(%Y-%m-%dT%H:%M:%SZ)%\",%REQ(X-CT-EVENT-REST)%}\n"
+    # Catches direct :4566 calls that skip the normal 443 path
+    # (e.g. localhost port-scan post-RCE). Same Lua/access_log,
+    # no TLS since the traffic is already plain HTTP.
+    - name: direct_floci_intercept
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: direct_floci_intercept
+                # Connection: close avoids a keep-alive framing bug
+                # seen here (Lua's body() + reused plain-HTTP
+                # connection eventually corrupts into 431 errors).
+                route_config:
+                  name: local_route
+                  response_headers_to_add:
+                    - header: { key: "Connection", value: "close" }
+                  virtual_hosts:
+                    - name: floci
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: floci, timeout: 30s }
+                http_filters: *shared_http_filters
+                access_log: *shared_access_log
+    # Fake EC2 instance metadata service. Automated cloud-recon tools
+    # (Pacu, ScoutSuite, linPEAS, cloud_enum) probe 169.254.169.254
+    # directly, independent of whatever env vars are already visible —
+    # this makes sure they find the canary creds too. Real IMDS is
+    # plain HTTP, unauthenticated at the network level (IMDSv2's
+    # token is a SSRF mitigation, not real auth) — same here, any
+    # token value is accepted.
+    - name: imds_intercept
+      address:
+        socket_address: { address: 169.254.169.254, port_value: 80 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: imds_intercept
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: imds
+                      domains: ["*"]
+                      routes:
+                        # Never actually reached — the Lua filter answers
+                        # every request itself via respond(). Router
+                        # still needs a syntactically valid route.
+                        - match: { prefix: "/" }
+                          route: { cluster: floci, timeout: 5s }
+                http_filters:
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      default_source_code:
+                        inline_string: |
+                          local function esc(s)
+                            return tostring(s):gsub('[\r\n]', ' '):gsub('\\', '\\\\'):gsub('"', '\\"')
+                          end
+
+                          -- Name implies a network restriction that
+                          -- doesn't actually exist (floci enforces no
+                          -- IAM at all) -- reads as "not worth taking
+                          -- this off-network" to anyone who's seen a
+                          -- real VPC-endpoint-restricted role before.
+                          local ROLE_NAME = "ray-ml-training-role-vpce-restricted"
+                          local CRED_PATH = "/latest/meta-data/iam/security-credentials/" .. ROLE_NAME
+
+                          function envoy_on_request(request_handle)
+                            local headers = request_handle:headers()
+                            local method = headers:get(":method")
+                            local path = headers:get(":path")
+
+                            local status, ctype, body, event = "404", "text/plain", "", "Unknown"
+
+                            if method == "PUT" and path == "/latest/api/token" then
+                              status, ctype, body, event = "200", "text/plain", "AQAAAENVUklUWS1UT0tFTi1GQUtFAA==", "GetToken"
+                            elseif method == "GET" and path == "/latest/meta-data/iam/security-credentials/" then
+                              status, ctype, body, event = "200", "text/plain", ROLE_NAME .. "\n", "ListSecurityCredentials"
+                            elseif method == "GET" and path == CRED_PATH then
+                              local akid = os.getenv("AWS_ACCESS_KEY_ID") or "unknown"
+                              local secret = os.getenv("AWS_SECRET_ACCESS_KEY") or "unknown"
+                              -- Static timestamps, not real time: os.date
+                              -- isn't guaranteed in this Lua sandbox
+                              -- (same reason the access log uses Envoy's
+                              -- %START_TIME% instead of Lua for eventTime).
+                              body = '{"Code":"Success","LastUpdated":"2026-01-01T00:00:00Z",' ..
+                                '"Type":"AWS-HMAC","AccessKeyId":"' .. esc(akid) ..
+                                '","SecretAccessKey":"' .. esc(secret) ..
+                                '","Token":"","Expiration":"2027-01-01T00:00:00Z"}'
+                              status, ctype, event = "200", "application/json", "GetSecurityCredentials"
+                            elseif method == "GET" and path == "/latest/meta-data/instance-id" then
+                              status, ctype, body, event = "200", "text/plain", "i-0a1b2c3d4e5f60789", "GetInstanceId"
+                            elseif method == "GET" and path == "/latest/dynamic/instance-identity/document" then
+                              body = '{"instanceId":"i-0a1b2c3d4e5f60789","region":"us-east-1","accountId":"000000000000"}'
+                              status, ctype, event = "200", "application/json", "GetInstanceIdentityDocument"
+                            end
+
+                            local req_id = headers:get("x-request-id") or "unknown"
+                            local rest =
+                              '"eventVersion":"1.08",' ..
+                              '"eventSource":"imds.internal",' ..
+                              '"eventName":"' .. esc(event) .. '",' ..
+                              '"awsRegion":"us-east-1",' ..
+                              '"sourceIPAddress":"unknown",' ..
+                              '"userAgent":"' .. esc(headers:get("user-agent") or "unknown") .. '",' ..
+                              '"userIdentity":{"type":"IAMUser","accessKeyId":"unknown","accountId":"000000000000"},' ..
+                              '"requestID":"' .. esc(req_id) .. '",' ..
+                              '"eventID":"' .. esc(req_id) .. '",' ..
+                              '"eventType":"AwsApiCall",' ..
+                              '"managementEvent":true,' ..
+                              '"recipientAccountId":"000000000000",' ..
+                              '"eventCategory":"Management",' ..
+                              '"requestParameters":null,' ..
+                              '"floci_honeypot":true'
+                            headers:replace("x-ct-event-rest", rest)
+
+                            request_handle:respond({[":status"] = status, ["content-type"] = ctype}, body)
+                          end
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                access_log: *shared_access_log
+  clusters:
+    - name: floci
+      connect_timeout: 2s
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      # Safety net, not the fix itself (see the 127.0.0.2 comment
+      # below for the actual root cause -- a redirect self-loop).
+      # Keeps the default max_connections::1024 from ever letting a
+      # future misbehaving client (or a real attacker's own tooling)
+      # spawn an unbounded storm of parallel connections against
+      # floci again.
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 50
+            max_pending_requests: 50
+            max_requests: 50
+      load_assignment:
+        cluster_name: floci
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  # 127.0.0.2, not .1: floci itself binds 0.0.0.0 so
+                  # this reaches it fine, but the iptables redirect
+                  # rule is scoped to -d 127.0.0.1 specifically --
+                  # dialing .2 here means this connection can never
+                  # match that rule and loop back into envoy itself.
+                  address:
+                    socket_address: { address: 127.0.0.2, port_value: 4566 }
+# Unix socket, not TCP: a TCP admin port on 127.0.0.1 is reachable
+# from every process sharing this network namespace -- the workload
+# container could query /clusters, /stats, /config_dump and learn the
+# interception topology, including the 127.0.0.2 address above. A
+# socket file lives in envoy's own filesystem, which stays private
+# even when the network namespace is shared (Kubernetes) or when
+# every service runs as a separate container attached to the same
+# network namespace (Compose).
+admin:
+  address:
+    pipe: { path: /tmp/envoy-admin.sock }

@@ -51,6 +51,11 @@ spec:
         - name: iptables-setup
           image: nicolaka/netshoot:latest
           command: ["/bin/sh", "/scripts/setup.sh"]
+          env:
+            # Shared script also runs unmodified under Compose, where
+            # this is left unset and the carve-out is just skipped.
+            - name: LOG_SHIP_ALLOW_IP
+              value: "100.103.210.114"
           securityContext:
             capabilities:
               add: ["NET_ADMIN", "NET_RAW"]

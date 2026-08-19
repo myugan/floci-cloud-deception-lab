@@ -1,0 +1,23 @@
+apiVersion: v1
+data:
+  iam-policy.json: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "DenyOutsideMLComputeVPCEndpoint",
+          "Effect": "Deny",
+          "NotAction": "sts:GetCallerIdentity",
+          "Resource": "*",
+          "Condition": {
+            "StringNotEquals": {
+              "aws:SourceVpce": "vpce-0f3a8b2c9d1e4f5a6"
+            }
+          }
+        }
+      ]
+    }
+kind: ConfigMap
+metadata:
+  name: honeypot-fake-iam-policy
+  namespace: floci-deception

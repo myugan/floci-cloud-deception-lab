@@ -74,12 +74,17 @@ our interception stack, not real AWS.
 
 ## Layout
 
-Two clusters:
-
 ```
-manifests/
+shared/      -> the actual security logic: Envoy config, iptables redirect
+                script, fake IAM policy doc, cert/canary generation. Both
+                deployments below read these files directly -- neither
+                keeps its own copy.
+manifests/   -> Kubernetes deployment
 ├── honeypot/  -> "timbernetes" (Ray, floci, envoy, iptables redirect, network lockdown)
 └── alerting/  -> management cluster (tails Loki, posts to Discord — not in the honeypot pod)
+compose/     -> Docker Compose deployment, single droplet instead of a
+                cluster -- see compose/README.md for what's different
+                and why
 ```
 
 `timbernetes` is a general-purpose Cluster API cluster (also runs

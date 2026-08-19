@@ -1,0 +1,94 @@
+# Kubernetes-specific bits with no Compose equivalent -- kept apart
+# from shared/ on purpose, not duplicated anywhere else:
+#   - promtail ships logs to the cluster's own Loki, meaningless
+#     outside this cluster
+#   - env-scrub strips kubelet-injected KUBERNETES_* env vars, which
+#     only exist under Kubernetes in the first place
+#   - docker-facade fakes what a plain `docker run` container looks
+#     like, which only matters when the runtime underneath genuinely
+#     isn't Docker (Compose already runs on Docker -- nothing to fake)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: honeypot-promtail-config
+  namespace: floci-deception
+data:
+  promtail.yaml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+    positions:
+      filename: /tmp/positions.yaml
+    clients:
+      # Ships to the cluster's existing Loki, bridged over Tailscale.
+      # Connecting by IP (not the ts.net hostname) because this pod's
+      # DNS is deliberately set to public resolvers (1.1.1.1/8.8.8.8,
+      # for the decoy's anti-fingerprinting) which can't resolve
+      # Tailscale MagicDNS names — server_name below still sets the
+      # correct TLS SNI/cert-validation hostname independent of the
+      # connection address, and insecure_skip_verify sidesteps needing
+      # Tailscale's own CA in this pod's trust store.
+      - url: https://100.103.210.114/loki/api/v1/push
+        tls_config:
+          server_name: loki.tail6c68d0.ts.net
+          insecure_skip_verify: true
+    scrape_configs:
+      - job_name: floci-deception
+        static_configs:
+          - targets: [localhost]
+            labels:
+              job: floci-deception
+              cluster: timbernetes
+              # Single constant marker for "this line is a CloudTrail-
+              # shaped event" — {log_type="cloudtrail"} alone pulls every
+              # one of them. Query further with `| json` for any specific
+              # field (eventName, eventSource, userIdentity.accessKeyId,
+              # awsRegion, ...) rather than pre-promoting each to its own
+              # label.
+              log_type: cloudtrail
+              __path__: /var/log/floci-ct/access.log
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: honeypot-env-scrub
+  namespace: floci-deception
+data:
+  # This file is mounted straight into the workload container and is
+  # fully readable from a compromised shell -- no comments in it that
+  # wouldn't survive being read by whoever's inside. enableServiceLinks:
+  # false doesn't stop kubelet injecting KUBERNETES_SERVICE_*/PORT* env
+  # vars for the built-in "kubernetes" Service (verified: that setting
+  # only governs vars for other Services in the namespace), so this
+  # strips them before exec'ing the real command.
+  entrypoint.sh: |
+    #!/bin/sh
+    for v in $(env | cut -d= -f1 | grep '^KUBERNETES_'); do
+      unset "$v"
+    done
+    exec "$@"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: honeypot-docker-facade
+  namespace: floci-deception
+data:
+  # Replaces kubelet's auto-generated /etc/hosts (which starts with
+  # "# Kubernetes-managed hosts file.") with what a plain `docker run`
+  # container actually gets — no banner, hostname is the container's
+  # own short ID. The bridge IP here is cosmetic text only; the real
+  # interface still shows the actual pod CIDR address (10.244.x.x) on
+  # `ip addr` — that can't be faked without hostNetwork, which would
+  # break the netns-scoped iptables redirect this whole setup relies on.
+  hosts: |
+    127.0.0.1	localhost
+    ::1	localhost ip6-localhost ip6-loopback
+    172.17.0.5	16f4c16e35b8
+  # Docker engine (docker-shim) drops this empty marker file at container
+  # root; containerd/CRI (what this cluster actually runs) does not.
+  # Recreating it defeats the classic `[ -f /.dockerenv ] && echo docker`
+  # check scripts use.
+  dockerenv: ""

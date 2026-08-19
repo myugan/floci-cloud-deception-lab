@@ -1,0 +1,122 @@
+# Same stack as manifests/, ported to plain Docker Compose for a
+# single droplet instead of a Kubernetes cluster. Shares its actual
+# security logic (envoy.yaml, the iptables redirect, the fake IAM
+# policy doc) with the Kubernetes deployment via ../shared/ -- nothing
+# here is a forked copy that can silently drift from the hardened,
+# tested version.
+#
+# What's deliberately different from manifests/, and why:
+#   - No Cilium NetworkPolicy equivalent. A bare droplet has no CNI to
+#     enforce egress lockdown the way the k8s deployment does -- if
+#     you need that here, it has to be iptables-based instead, not
+#     built yet.
+#   - No PID-namespace isolation concern: Compose doesn't share PID
+#     namespaces across services by default, so `ps aux` inside
+#     ml-worker never shows the other containers to begin with -- the
+#     leak that shareProcessNamespace caused in k8s can't happen here.
+#   - No entrypoint.sh / docker-facade: those existed specifically to
+#     hide Kubernetes-only artifacts (kubelet-injected env vars, the
+#     kubelet-managed /etc/hosts banner). None of that exists outside
+#     Kubernetes, so there's nothing to hide.
+#
+# "netns" is a placeholder that exists only to hold the shared network
+# namespace everything else attaches to via network_mode: service:netns
+# -- Compose's equivalent of "one pod, one netns". It has to start
+# before netinit can attach and install the iptables rules + the
+# 169.254.169.254 loopback alias, which in turn has to finish before
+# envoy starts (its IMDS listener binds that address immediately on
+# startup and would fail if it isn't there yet).
+
+services:
+  netns:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    ports:
+      - "443:8443"   # aws_intercept (TLS) -- the AWS-bound traffic path
+      - "8265:8265"  # Ray dashboard -- the actual RCE entry point
+
+  netinit:
+    image: nicolaka/netshoot:latest
+    network_mode: "service:netns"
+    cap_add: ["NET_ADMIN", "NET_RAW"]
+    depends_on:
+      netns:
+        condition: service_started
+    volumes:
+      - ../shared/iptables-setup.sh:/scripts/setup.sh:ro
+    command: ["/bin/sh", "/scripts/setup.sh"]
+    restart: "no"
+
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    network_mode: "service:netns"
+    depends_on:
+      netinit:
+        condition: service_completed_successfully
+    environment:
+      # The image's own entrypoint drops privileges to a non-root
+      # "envoy" user by default, which then can't read the 600-mode
+      # private key below. Keeping it root matches the Kubernetes
+      # deployment's actual behavior (envoy-sidecar there runs as
+      # root too) rather than loosening the key file's permissions.
+      ENVOY_UID: "0"
+    env_file:
+      - ./secrets/canary.env  # IMDS Lua filter hands these back as the fake role's credentials
+    volumes:
+      - ../shared/envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ./secrets/tls/leaf-cert.pem:/certs/leaf-cert.pem:ro
+      - ./secrets/tls/leaf-key.pem:/certs/leaf-key.pem:ro
+      - ct-logs:/var/log/floci-ct
+    command: ["-c", "/etc/envoy/envoy.yaml"]
+
+  ml-worker:
+    image: rayproject/ray:2.9.0-py311
+    network_mode: "service:netns"
+    depends_on:
+      netinit:
+        condition: service_completed_successfully
+    env_file:
+      - ./secrets/canary.env
+    environment:
+      # aws-cli / botocore honor these directly -- no code changes
+      # needed in the app to trust the interception CA.
+      AWS_CA_BUNDLE: /ca-bundle/ca-bundle.pem
+      REQUESTS_CA_BUNDLE: /ca-bundle/ca-bundle.pem
+      SSL_CERT_FILE: /ca-bundle/ca-bundle.pem
+    volumes:
+      - ./secrets/tls/ca-cert.pem:/ca-bundle/ca-bundle.pem:ro
+      - ./secrets/credentials:/home/ray/.aws/credentials:ro
+      - ../shared/iam-policy.json:/home/ray/.aws/iam-policy.json:ro
+    command: ["ray", "start", "--head", "--dashboard-host=0.0.0.0", "--block"]
+
+  floci:
+    image: floci/floci:latest
+    network_mode: "service:netns"
+    depends_on:
+      netinit:
+        condition: service_completed_successfully
+    environment:
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - floci-data:/var/lib/floci
+
+  # Off by default -- `docker compose --profile logging up` to include
+  # it. Without it, `docker compose logs -f envoy` already shows the
+  # same CloudTrail-shaped JSON lines live; this is only needed to
+  # ship them somewhere else. Edit promtail.yaml's client URL before
+  # enabling.
+  promtail:
+    image: grafana/promtail:latest
+    profiles: ["logging"]
+    network_mode: "service:netns"
+    depends_on:
+      netinit:
+        condition: service_completed_successfully
+    volumes:
+      - ./promtail.yaml:/etc/promtail/promtail.yaml:ro
+      - ct-logs:/var/log/floci-ct:ro
+    command: ["-config.file=/etc/promtail/promtail.yaml"]
+
+volumes:
+  ct-logs: {}
+  floci-data: {}
