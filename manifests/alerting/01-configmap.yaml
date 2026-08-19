@@ -20,11 +20,12 @@ data:
     KeyError above). Compose's optional profile passes it through as\n    # an empty
     string when .env isn't set, which would otherwise fail\n    # opaquely inside
     requests.post() instead of here.\n    raise RuntimeError(\"DISCORD_WEBHOOK_URL
-    is empty -- set it in .env\")\n\nSEEN_MAX = 500\n\nCOLOR_CRITICAL = 0xE74C3C  #
-    red    — privesc / persistence / destructive\nCOLOR_WARNING = 0xE67E22   # orange
-    — general mutating calls\nCOLOR_INFO = 0x95A5A6      # grey   — recon / read-only,
-    routine noise\n\n# Purely for choosing a color — no labels, no Loki, nothing upstream.\n_CRITICAL_RE
-    = re.compile(\n    r\"^(Attach.*Policy|Put.*Policy|Detach.*Policy|.*PolicyVersion|AssumeRole.*|\"\n
+    is empty -- set it in .env\")\n\nCANARY_ACCESS_KEY_ID = os.environ.get(\"CANARY_ACCESS_KEY_ID\",
+    \"\")\n\nSEEN_MAX = 500\n\nCOLOR_CRITICAL = 0xE74C3C  # red    — privesc / persistence
+    / destructive\nCOLOR_WARNING = 0xE67E22   # orange — general mutating calls\nCOLOR_INFO
+    = 0x95A5A6      # grey   — recon / read-only, routine noise\n\n# Purely for choosing
+    a color — no labels, no Loki, nothing upstream.\n_CRITICAL_RE = re.compile(\n
+    \   r\"^(Attach.*Policy|Put.*Policy|Detach.*Policy|.*PolicyVersion|AssumeRole.*|\"\n
     \   r\"CreateLoginProfile|UpdateLoginProfile|AddUserToGroup|UpdateAssumeRolePolicy|\"\n
     \   r\"CreateAccessKey|UpdateAccessKey|Delete.*|Terminate.*|Revoke.*)$\"\n)\n_INFO_RE
     = re.compile(r\"^(Get.*|List.*|Describe.*|Lookup.*)$\")\n\n\ndef severity_color(event_name:
@@ -69,7 +70,17 @@ data:
     logs) instead of paging.\"\"\"\n    try:\n        event = json.loads(line)\n    except
     Exception:\n        print(f\"cloudtrail activity (unparsed, not alerted): {line[:200]}\",
     flush=True)\n        return\n    if already_seen(event.get(\"requestID\")):\n
-    \       return\n    post_discord({\"embeds\": [format_embed(event)]})\n"
+    \       return\n\n    # Every line here already passed Envoy's own header_filter,
+    so\n    # it's a genuine SigV4-shaped call -- but that only proves *some*\n    #
+    access key was used, not necessarily the one we planted (a\n    # scanner can
+    send AWS's own public example key, or a random\n    # guess, and still parse as
+    valid SigV4 shape). CANARY_ACCESS_KEY_ID\n    # is the actual bait credential's
+    ID; only alert when it's the one\n    # in use. Left permissive (alerts on anything)
+    if unset, so a\n    # deployment that forgot to wire it doesn't go silently blind.\n
+    \   akid = event.get(\"userIdentity\", {}).get(\"accessKeyId\", \"\")\n    if
+    CANARY_ACCESS_KEY_ID and akid != CANARY_ACCESS_KEY_ID:\n        print(f\"cloudtrail
+    activity (non-canary key, not alerted): eventName={event.get('eventName')} accessKeyId={akid}\",
+    flush=True)\n        return\n\n    post_discord({\"embeds\": [format_embed(event)]})\n"
   tailer.py: |
     #!/usr/bin/env python3
     """

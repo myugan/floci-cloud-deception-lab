@@ -113,11 +113,19 @@ Ray takes ~60-100s to start. Check: `kubectl -n floci-deception get pods`.
 kubectl config use-context <management-cluster-context>
 ./scripts/set-discord-webhook.sh 'https://discord.com/api/webhooks/...'
 kubectl apply -f manifests/alerting/
+kubectl apply -f ../scripts/canary-access-key-id.yaml   # written by generate-canary-secret.sh above
 ```
 
 One Discord embed per event, posted as it happens, colored by severity
 (red = privesc/persistence/destructive, orange = mutation, grey =
 recon). A small `requestID` dedup guard drops exact repeats.
+
+Alerts only fire for the actual canary key, not just any AWS-shaped
+request — `discord-alert-tailer` compares each event's `accessKeyId`
+against `canary-access-key-id.yaml` above. Anything else that reaches
+floci with a differently-shaped (but still valid SigV4) credential —
+e.g. someone probing with AWS's own public example key — still shows
+up in the pod's logs, just without a Discord ping.
 
 ## Public exposure (Tailscale Funnel)
 

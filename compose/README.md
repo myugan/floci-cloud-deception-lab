@@ -80,6 +80,13 @@ consecutive failures (a Running container proves nothing about whether an
 attacker can actually reach the thing — a dropped tunnel or DNS lag leaves
 every container healthy while the honeypot is invisible from outside).
 
+`discord-alert-tailer` only pings Discord for the actual canary key, not
+just any AWS-shaped request — it compares each event's `accessKeyId`
+against `CANARY_ACCESS_KEY_ID` (written into `secrets/canary.env` by
+`generate-canary-secret.sh`, same file envoy and ml-worker already use).
+Anything else that reaches floci with a differently-shaped but still
+valid SigV4 credential still shows up in `ct-logs`, just without a ping.
+
 Neither of these two run on the shared, intercepted network namespace like
 everything else in this file — they need real, unintercepted internet
 access to reach Discord's API and to check the public URL. Sharing the

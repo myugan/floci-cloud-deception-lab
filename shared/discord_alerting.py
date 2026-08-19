@@ -37,6 +37,8 @@ if not DISCORD_WEBHOOK:
     # opaquely inside requests.post() instead of here.
     raise RuntimeError("DISCORD_WEBHOOK_URL is empty -- set it in .env")
 
+CANARY_ACCESS_KEY_ID = os.environ.get("CANARY_ACCESS_KEY_ID", "")
+
 SEEN_MAX = 500
 
 COLOR_CRITICAL = 0xE74C3C  # red    — privesc / persistence / destructive
@@ -151,4 +153,18 @@ def handle_line(line: str):
         return
     if already_seen(event.get("requestID")):
         return
+
+    # Every line here already passed Envoy's own header_filter, so
+    # it's a genuine SigV4-shaped call -- but that only proves *some*
+    # access key was used, not necessarily the one we planted (a
+    # scanner can send AWS's own public example key, or a random
+    # guess, and still parse as valid SigV4 shape). CANARY_ACCESS_KEY_ID
+    # is the actual bait credential's ID; only alert when it's the one
+    # in use. Left permissive (alerts on anything) if unset, so a
+    # deployment that forgot to wire it doesn't go silently blind.
+    akid = event.get("userIdentity", {}).get("accessKeyId", "")
+    if CANARY_ACCESS_KEY_ID and akid != CANARY_ACCESS_KEY_ID:
+        print(f"cloudtrail activity (non-canary key, not alerted): eventName={event.get('eventName')} accessKeyId={akid}", flush=True)
+        return
+
     post_discord({"embeds": [format_embed(event)]})

@@ -9,4 +9,5 @@ manifests/alerting/02-secret.yaml
 # already, this is just belt-and-suspenders in case one gets created
 # locally during testing).
 manifests/honeypot/01-canary-secret.yaml
+scripts/canary-access-key-id.yaml
 __pycache__/

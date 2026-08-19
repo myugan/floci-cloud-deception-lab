@@ -27,6 +27,11 @@ spec:
                 secretKeyRef:
                   name: discord-webhook
                   key: url
+            - name: CANARY_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: canary-access-key-id
+                  key: CANARY_ACCESS_KEY_ID
           volumeMounts:
             - name: script
               mountPath: /app

@@ -260,32 +260,42 @@ data:
                                   action = generic_rest_action(method, path)
                                 end
 
-                                local req_id = headers:get("x-request-id") or "unknown"
-                                local user_agent = headers:get("user-agent") or "unknown"
+                                -- No Credential=.../aws4_request match means
+                                -- there was no SigV4 Authorization header at
+                                -- all -- not an AWS API call, just something
+                                -- (usually a mass internet scanner) hitting
+                                -- the public :443 directly. Leaving
+                                -- x-ct-event-rest unset here means the
+                                -- access log's header_filter drops it
+                                -- entirely, same as the TLS-only-probe case.
+                                if service then
+                                  local req_id = headers:get("x-request-id") or "unknown"
+                                  local user_agent = headers:get("user-agent") or "unknown"
 
-                                local identity_type = "IAMUser"
-                                if akid and akid:sub(1, 4) == "ASIA" then
-                                  identity_type = "AssumedRole"
+                                  local identity_type = "IAMUser"
+                                  if akid and akid:sub(1, 4) == "ASIA" then
+                                    identity_type = "AssumedRole"
+                                  end
+
+                                  local rest =
+                                    '"eventVersion":"1.08",' ..
+                                    '"eventSource":"' .. esc(service) .. '.amazonaws.com",' ..
+                                    '"eventName":"' .. esc(action) .. '",' ..
+                                    '"awsRegion":"' .. esc(region or "unknown") .. '",' ..
+                                    '"userAgent":"' .. esc(user_agent) .. '",' ..
+                                    '"userIdentity":{"type":"' .. identity_type .. '","accessKeyId":"' .. esc(akid or "unknown") ..
+                                      '","accountId":"' .. FAKE_ACCOUNT_ID .. '"},' ..
+                                    '"requestID":"' .. esc(req_id) .. '",' ..
+                                    '"eventID":"' .. esc(req_id) .. '",' ..
+                                    '"eventType":"AwsApiCall",' ..
+                                    '"managementEvent":true,' ..
+                                    '"recipientAccountId":"' .. FAKE_ACCOUNT_ID .. '",' ..
+                                    '"eventCategory":"Management",' ..
+                                    '"requestParameters":' .. request_params .. ',' ..
+                                    '"floci_honeypot":true'
+
+                                  headers:replace("x-ct-event-rest", rest)
                                 end
-
-                                local rest =
-                                  '"eventVersion":"1.08",' ..
-                                  '"eventSource":"' .. esc(service or "unknown") .. '.amazonaws.com",' ..
-                                  '"eventName":"' .. esc(action) .. '",' ..
-                                  '"awsRegion":"' .. esc(region or "unknown") .. '",' ..
-                                  '"userAgent":"' .. esc(user_agent) .. '",' ..
-                                  '"userIdentity":{"type":"' .. identity_type .. '","accessKeyId":"' .. esc(akid or "unknown") ..
-                                    '","accountId":"' .. FAKE_ACCOUNT_ID .. '"},' ..
-                                  '"requestID":"' .. esc(req_id) .. '",' ..
-                                  '"eventID":"' .. esc(req_id) .. '",' ..
-                                  '"eventType":"AwsApiCall",' ..
-                                  '"managementEvent":true,' ..
-                                  '"recipientAccountId":"' .. FAKE_ACCOUNT_ID .. '",' ..
-                                  '"eventCategory":"Management",' ..
-                                  '"requestParameters":' .. request_params .. ',' ..
-                                  '"floci_honeypot":true'
-
-                                headers:replace("x-ct-event-rest", rest)
                               end
 
                               function envoy_on_response(response_handle)

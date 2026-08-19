@@ -158,6 +158,8 @@ services:
         condition: service_started
     environment:
       DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+    env_file:
+      - ./secrets/canary.env  # only CANARY_ACCESS_KEY_ID is used here -- lets handle_line tell the real canary key from any other AWS-shaped credential
     volumes:
       - ../shared/file-tailer.py:/app/file-tailer.py:ro
       - ../shared/discord_alerting.py:/app/discord_alerting.py:ro
