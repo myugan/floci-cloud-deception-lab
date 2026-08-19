@@ -91,6 +91,18 @@ data:
                           "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
                           default_source_code:
                             inline_string: |
+                              -- floci hardcodes 000000000000 as its account
+                              -- ID everywhere (confirmed: no env var
+                              -- controls it, just a fixed literal baked
+                              -- into the binary) -- an obviously-fake
+                              -- all-zero account ID undercuts every
+                              -- response floci sends. Rewritten to this in
+                              -- both floci's own response bodies
+                              -- (envoy_on_response below) and our own
+                              -- CloudTrail-shaped log, so the two always
+                              -- agree.
+                              local FAKE_ACCOUNT_ID = "350326205915"
+
                               local function esc(s)
                                 return tostring(s):gsub('[\r\n]', ' '):gsub('\\', '\\\\'):gsub('"', '\\"')
                               end
@@ -354,6 +366,18 @@ data:
                                   src_ip = addr
                                 end
 
+                                -- ASIA-prefixed keys are STS temporary
+                                -- credentials (AssumeRole and friends);
+                                -- AKIA-prefixed are long-term IAM user
+                                -- keys. Real CloudTrail distinguishes
+                                -- these -- exactly the signal an analyst
+                                -- watches for when tracing an attacker's
+                                -- lateral movement via AssumeRole.
+                                local identity_type = "IAMUser"
+                                if akid and akid:sub(1, 4) == "ASIA" then
+                                  identity_type = "AssumedRole"
+                                end
+
                                 local rest =
                                   '"eventVersion":"1.08",' ..
                                   '"eventSource":"' .. esc(service or "unknown") .. '.amazonaws.com",' ..
@@ -361,13 +385,13 @@ data:
                                   '"awsRegion":"' .. esc(region or "unknown") .. '",' ..
                                   '"sourceIPAddress":"' .. esc(src_ip) .. '",' ..
                                   '"userAgent":"' .. esc(user_agent) .. '",' ..
-                                  '"userIdentity":{"type":"IAMUser","accessKeyId":"' .. esc(akid or "unknown") ..
-                                    '","accountId":"000000000000"},' ..
+                                  '"userIdentity":{"type":"' .. identity_type .. '","accessKeyId":"' .. esc(akid or "unknown") ..
+                                    '","accountId":"' .. FAKE_ACCOUNT_ID .. '"},' ..
                                   '"requestID":"' .. esc(req_id) .. '",' ..
                                   '"eventID":"' .. esc(req_id) .. '",' ..
                                   '"eventType":"AwsApiCall",' ..
                                   '"managementEvent":true,' ..
-                                  '"recipientAccountId":"000000000000",' ..
+                                  '"recipientAccountId":"' .. FAKE_ACCOUNT_ID .. '",' ..
                                   '"eventCategory":"Management",' ..
                                   '"requestParameters":' .. request_params .. ',' ..
                                   '"floci_honeypot":true'
@@ -378,6 +402,23 @@ data:
                                 -- leave two header values, which
                                 -- %REQ(...)% joins into broken JSON.
                                 headers:replace("x-ct-event-rest", rest)
+                              end
+
+                              -- floci's own response bodies still say
+                              -- 000000000000 (the account ID it hardcodes
+                              -- internally) -- a literal, fixed-length
+                              -- string every time, so a straight
+                              -- substitution is safe and can't corrupt
+                              -- the surrounding XML/JSON structure.
+                              function envoy_on_response(response_handle)
+                                local body = response_handle:body()
+                                if not body then
+                                  return
+                                end
+                                local raw = body:getBytes(0, body:length())
+                                if raw and raw:find("000000000000", 1, true) then
+                                  body:setBytes(raw:gsub("000000000000", FAKE_ACCOUNT_ID))
+                                end
                               end
                       - name: envoy.filters.http.router
                         typed_config:
@@ -485,6 +526,11 @@ data:
                               -- this off-network" to anyone who's seen a
                               -- real VPC-endpoint-restricted role before.
                               local ROLE_NAME = "ray-ml-training-role-vpce-restricted"
+                              -- Same value as the main listener's Lua --
+                              -- kept as a literal here too since this is a
+                              -- separate inline_string block with no
+                              -- shared scope between them.
+                              local FAKE_ACCOUNT_ID = "350326205915"
                               local CRED_PATH = "/latest/meta-data/iam/security-credentials/" .. ROLE_NAME
 
                               function envoy_on_request(request_handle)
@@ -513,7 +559,7 @@ data:
                                 elseif method == "GET" and path == "/latest/meta-data/instance-id" then
                                   status, ctype, body, event = "200", "text/plain", "i-0a1b2c3d4e5f60789", "GetInstanceId"
                                 elseif method == "GET" and path == "/latest/dynamic/instance-identity/document" then
-                                  body = '{"instanceId":"i-0a1b2c3d4e5f60789","region":"us-east-1","accountId":"000000000000"}'
+                                  body = '{"instanceId":"i-0a1b2c3d4e5f60789","region":"us-east-1","accountId":"' .. FAKE_ACCOUNT_ID .. '"}'
                                   status, ctype, event = "200", "application/json", "GetInstanceIdentityDocument"
                                 end
 
@@ -525,12 +571,12 @@ data:
                                   '"awsRegion":"us-east-1",' ..
                                   '"sourceIPAddress":"unknown",' ..
                                   '"userAgent":"' .. esc(headers:get("user-agent") or "unknown") .. '",' ..
-                                  '"userIdentity":{"type":"IAMUser","accessKeyId":"unknown","accountId":"000000000000"},' ..
+                                  '"userIdentity":{"type":"IAMUser","accessKeyId":"unknown","accountId":"' .. FAKE_ACCOUNT_ID .. '"},' ..
                                   '"requestID":"' .. esc(req_id) .. '",' ..
                                   '"eventID":"' .. esc(req_id) .. '",' ..
                                   '"eventType":"AwsApiCall",' ..
                                   '"managementEvent":true,' ..
-                                  '"recipientAccountId":"000000000000",' ..
+                                  '"recipientAccountId":"' .. FAKE_ACCOUNT_ID .. '",' ..
                                   '"eventCategory":"Management",' ..
                                   '"requestParameters":null,' ..
                                   '"floci_honeypot":true'
