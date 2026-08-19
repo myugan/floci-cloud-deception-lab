@@ -3,8 +3,8 @@
 Same honeypot as `../manifests/`, ported to plain Docker Compose for a single
 droplet instead of a Kubernetes cluster. The actual security logic (Envoy's
 interception + CloudTrail logging + IMDS emulation, the iptables redirect,
-the fake IAM policy doc) lives in `../shared/` and is identical between both
-deployments — nothing here is a forked copy.
+the fake IAM policy doc, the resource-seeding script) lives in `../shared/`
+and is identical between both deployments — nothing here is a forked copy.
 
 ## Deploy
 
@@ -37,6 +37,24 @@ first):
 ```sh
 docker compose --profile logging up -d
 ```
+
+## Resource seeding
+
+floci's storage is in-memory — every restart comes back completely empty
+across every service, which is itself a tell: a real compromised AWS
+account almost never looks this blank. The `floci-seed` container populates
+a small, believable set of resources on startup (a few EC2 instances, three
+S3 buckets, two IAM roles including the one the IMDS bait already implies,
+one DynamoDB table), then sleeps forever. Runs against floci directly,
+bypassing envoy, so none of it shows up in the CloudTrail-shaped log or
+triggers a Discord alert.
+
+EC2 instances specifically: floci auto-transitions every `RunInstances`
+result to `terminated` within a few seconds regardless of parameters, and
+won't allow `StartInstances` to undo it (matches real AWS's own
+irreversible-termination rule) — that's floci's own behavior, not something
+this fixes. `describe-instances` still shows full realistic detail instead
+of an empty list; it just won't read as a currently-running fleet.
 
 ## One gotcha if you ever touch `docker-compose.yml`
 

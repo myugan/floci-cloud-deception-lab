@@ -100,6 +100,22 @@ services:
     volumes:
       - floci-data:/var/lib/floci
 
+  # floci's storage is in-memory -- every restart comes back
+  # completely empty across every service, which is itself a tell (a
+  # real compromised account is never this blank). Populates a small,
+  # believable resource set on startup, then sleeps forever -- exiting
+  # would make Compose's restart handling re-run every create call and
+  # pile up duplicate EC2 instances each cycle.
+  floci-seed:
+    image: python:3.12-slim
+    network_mode: "service:netns"
+    depends_on:
+      netinit:
+        condition: service_completed_successfully
+    volumes:
+      - ../shared/seed-resources.py:/app/seed-resources.py:ro
+    command: ["python", "/app/seed-resources.py"]
+
   # Off by default -- `docker compose --profile logging up` to include
   # it. Without it, `docker compose logs -f envoy` already shows the
   # same CloudTrail-shaped JSON lines live; this is only needed to

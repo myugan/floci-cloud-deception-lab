@@ -207,6 +207,20 @@ spec:
             - name: floci-data
               mountPath: /var/lib/floci
 
+        # floci's storage is in-memory -- every restart comes back
+        # completely empty across every service, which is itself a
+        # tell (a real compromised account is never this blank).
+        # Populates a small, believable resource set on startup, then
+        # sleeps forever -- exiting would make the default
+        # restartPolicy re-run every create call and pile up
+        # duplicate EC2 instances each cycle.
+        - name: floci-seed
+          image: python:3.12-slim
+          command: ["python", "/app/seed-resources.py"]
+          volumeMounts:
+            - name: seed-script
+              mountPath: /app
+
       volumes:
         - name: iptables-script
           configMap:
@@ -244,3 +258,6 @@ spec:
         - name: promtail-config
           configMap:
             name: honeypot-promtail-config
+        - name: seed-script
+          configMap:
+            name: honeypot-seed-script
