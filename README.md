@@ -77,8 +77,9 @@ our interception stack, not real AWS.
 ```
 shared/      -> the actual security logic: Envoy config, iptables redirect
                 script, fake IAM policy doc, resource seeding, cert/canary
-                generation. Both deployments below read these files
-                directly -- neither keeps its own copy.
+                generation, and the Discord alerting core (formatting,
+                severity, retry, dedup). Both deployments below read
+                these files directly -- neither keeps its own copy.
 manifests/   -> Kubernetes deployment
 ├── honeypot/  -> "timbernetes" (Ray, floci, envoy, iptables redirect, network lockdown)
 └── alerting/  -> management cluster (tails Loki, posts to Discord — not in the honeypot pod)

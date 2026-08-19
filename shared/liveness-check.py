@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-Checks the honeypot's public Funnel URL on a timer and posts to Discord
-when it goes down or comes back. A Running pod doesn't prove the thing
-an attacker would actually hit still works -- Funnel can drop, DNS can
-lag, the pod can be mid-restart. This checks the same public path a
-real attacker would use, not the cluster's internal view of itself.
+Checks the honeypot's public URL on a timer and posts to Discord when
+it goes down or comes back. A Running pod/container doesn't prove the
+thing an attacker would actually hit still works -- a public tunnel
+can drop, DNS can lag, the workload can be mid-restart. This checks
+the same public path a real attacker would use, not the deployment's
+internal view of itself.
+
+Orchestrator-agnostic: HONEYPOT_URL is required, not hardcoded, since
+it's inherently different per deployment (a Tailscale Funnel hostname
+for the Kubernetes deployment, a droplet's own IP or domain for
+Compose).
 
 Two consecutive failures before alerting, not one -- a single blip
 isn't worth a page.
@@ -13,8 +19,9 @@ import os
 import time
 import requests
 
-URL = "https://ml-compute-01.tail6c68d0.ts.net/"
-DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
+from discord_alerting import post_discord
+
+URL = os.environ["HONEYPOT_URL"]
 CHECK_INTERVAL_SECONDS = 60
 FAILURES_BEFORE_ALERT = 2
 
@@ -30,18 +37,6 @@ def check() -> tuple[bool, str]:
         return False, f"status={r.status_code}, unexpected body"
     except Exception as e:
         return False, str(e)[:200]
-
-
-def post_discord(payload: dict):
-    for attempt in range(3):
-        try:
-            r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-            print(f"posted to discord: status={r.status_code}", flush=True)
-            return
-        except Exception as e:
-            print(f"discord post failed (attempt {attempt + 1}/3): {e}", flush=True)
-            time.sleep(2 ** attempt)
-    print("discord post dropped after 3 attempts", flush=True)
 
 
 def main():

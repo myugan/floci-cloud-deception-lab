@@ -1,64 +1,121 @@
 apiVersion: v1
 data:
-  tailer.py: "#!/usr/bin/env python3\n\"\"\"\nTails Loki's real-time WebSocket API
-    for {log_type=\"cloudtrail\"} and posts\none Discord embed per event, as it arrives
-    — no batching, no polling delay,\nno firing/resolved lifecycle.\n\nSeverity coloring
-    is purely a display concern here, not a Loki label\n(kept out of the log data
-    model per earlier feedback) — picks an embed\ncolor from the action name so a
-    busy channel is scannable at a glance.\n\nDedup guard: Envoy's Lua callback can
-    fire more than once for the same\nlogical request, producing repeated identical
-    eventIDs in the log. A\nsmall recently-seen set drops repeats so one client call
-    never posts as\nmultiple identical embeds.\n\"\"\"\nimport json\nimport os\nimport
-    re\nimport time\nimport urllib.parse\nfrom collections import deque\n\nimport
-    requests\nimport websocket\n\nLOKI_WS = (\n    \"ws://loki.loki.svc.cluster.local:3100/loki/api/v1/tail?query=\"\n
-    \   + urllib.parse.quote('{log_type=\"cloudtrail\"}')\n)\nDISCORD_WEBHOOK = os.environ[\"DISCORD_WEBHOOK_URL\"]\n\nSEEN_MAX
+  discord_alerting.py: "\"\"\"\nShared core for posting CloudTrail-shaped events to
+    Discord as they\nhappen -- one embed per event, no batching, no polling delay,
+    no\nfiring/resolved lifecycle. Orchestrator-agnostic: this is the part\nthat's
+    identical regardless of where the events come from.\n\nTwo different tailers import
+    this:\n  - manifests/alerting/tailer.py tails Loki's live websocket API.\n  -
+    compose's tailer (shared/file-tailer.py) tails the local log file\n    directly,
+    since Compose doesn't assume a Loki is available.\nOnly \"how events arrive\"
+    differs between them; formatting, severity\ncoloring, retry-on-failure, and the
+    dedup guard all live here once.\n\nSeverity coloring is purely a display concern
+    here, not a log label\n(kept out of the log data model per earlier feedback) —
+    picks an\nembed color from the action name so a busy channel is scannable at a\nglance.\n\nDedup
+    guard: Envoy's Lua callback can fire more than once for the\nsame logical request,
+    producing repeated identical eventIDs in the\nlog. A small recently-seen set drops
+    repeats so one client call never\nposts as multiple identical embeds.\n\"\"\"\nimport
+    json\nimport os\nimport re\nimport time\nfrom collections import deque\n\nimport
+    requests\n\nDISCORD_WEBHOOK = os.environ[\"DISCORD_WEBHOOK_URL\"]\n\nSEEN_MAX
     = 500\n\nCOLOR_CRITICAL = 0xE74C3C  # red    — privesc / persistence / destructive\nCOLOR_WARNING
     = 0xE67E22   # orange — general mutating calls\nCOLOR_INFO = 0x95A5A6      # grey
     \  — recon / read-only, routine noise\n\n# Purely for choosing a color — no labels,
     no Loki, nothing upstream.\n_CRITICAL_RE = re.compile(\n    r\"^(Attach.*Policy|Put.*Policy|Detach.*Policy|.*PolicyVersion|AssumeRole.*|\"\n
     \   r\"CreateLoginProfile|UpdateLoginProfile|AddUserToGroup|UpdateAssumeRolePolicy|\"\n
     \   r\"CreateAccessKey|UpdateAccessKey|Delete.*|Terminate.*|Revoke.*)$\"\n)\n_INFO_RE
-    = re.compile(r\"^(Get.*|List.*|Describe.*|Lookup.*)$\")\n\ndef severity_color(event_name:
+    = re.compile(r\"^(Get.*|List.*|Describe.*|Lookup.*)$\")\n\n\ndef severity_color(event_name:
     str) -> int:\n    if _CRITICAL_RE.match(event_name):\n        return COLOR_CRITICAL\n
-    \   if _INFO_RE.match(event_name):\n        return COLOR_INFO\n    return COLOR_WARNING\n\ndef
+    \   if _INFO_RE.match(event_name):\n        return COLOR_INFO\n    return COLOR_WARNING\n\n\ndef
     _truncate(s: str, limit: int) -> str:\n    return s if len(s) <= limit else s[:
-    limit - 1] + \"…\"\n\ndef format_embed(d: dict) -> dict:\n    ua = d.get(\"userAgent\",
+    limit - 1] + \"…\"\n\n\ndef format_embed(d: dict) -> dict:\n    ua = d.get(\"userAgent\",
     \"?\")\n    if len(ua) > 200:\n        ua = ua[:200] + \"…\"\n\n    action = d.get(\"eventName\",
     \"?\")\n    title = \"\U0001F6A8 Canary key triggered\"\n\n    fields = [\n        {\"name\":
     \"Service\", \"value\": f\"`{d.get('eventSource', '?')}`\", \"inline\": True},\n
     \       {\"name\": \"Action\", \"value\": f\"**{action}**\", \"inline\": True},\n
     \       {\"name\": \"Region\", \"value\": f\"`{d.get('awsRegion', '?')}`\", \"inline\":
-    True},\n    ]\n\n    params = d.get(\"requestParameters\")\n    if params:\n        params_str
-    = _truncate(json.dumps(params), 1000)\n        fields.append({\"name\": \"Parameters\",
-    \"value\": f\"```json\\n{params_str}\\n```\", \"inline\": False})\n\n    fields.append({\"name\":
-    \"User-Agent\", \"value\": f\"```{ua}```\", \"inline\": False})\n\n    return
-    {\n        \"title\": title,\n        \"color\": severity_color(action),\n        \"fields\":
-    fields,\n        \"footer\": {\"text\": \"floci-deception\"},\n        \"timestamp\":
-    d.get(\"eventTime\"),\n    }\n\ndef post_discord(payload: dict):\n    for attempt
-    in range(3):\n        try:\n            r = requests.post(DISCORD_WEBHOOK, json=payload,
-    timeout=10)\n            if r.status_code == 429:\n                wait = r.json().get(\"retry_after\",
-    1)\n                time.sleep(wait)\n                continue\n            print(f\"posted
-    to discord: status={r.status_code}\", flush=True)\n            return\n        except
-    Exception as e:\n            print(f\"discord post failed (attempt {attempt +
-    1}/3): {e}\", flush=True)\n            time.sleep(2 ** attempt)\n    print(\"discord
-    post dropped after 3 attempts\", flush=True)\n\n_seen_ids = set()\n_seen_order
-    = deque()\n\ndef already_seen(event_id: str) -> bool:\n    if not event_id:\n
-    \       return False\n    if event_id in _seen_ids:\n        return True\n    _seen_ids.add(event_id)\n
-    \   _seen_order.append(event_id)\n    if len(_seen_order) > SEEN_MAX:\n        old
-    = _seen_order.popleft()\n        _seen_ids.discard(old)\n    return False\n\ndef
-    on_message(ws, message):\n    data = json.loads(message)\n    for stream in data.get(\"streams\",
-    []):\n        for _ts, line in stream.get(\"values\", []):\n            try:\n
-    \               event = json.loads(line)\n            except Exception:\n                post_discord({\"content\":
-    f\"cloudtrail activity (unparsed): {line[:200]}\"})\n                continue\n
-    \           if already_seen(event.get(\"requestID\")):\n                continue\n
-    \           post_discord({\"embeds\": [format_embed(event)]})\n\ndef on_error(ws,
-    error):\n    print(f\"ws error: {error}\", flush=True)\n\ndef on_close(ws, *_a):\n
-    \   print(\"ws closed\", flush=True)\n\ndef on_open(ws):\n    print(f\"ws connected:
-    {LOKI_WS}\", flush=True)\n\ndef main():\n    while True:\n        ws = websocket.WebSocketApp(\n
-    \           LOKI_WS,\n            on_open=on_open,\n            on_message=on_message,\n
-    \           on_error=on_error,\n            on_close=on_close,\n        )\n        ws.run_forever()\n
-    \       print(\"reconnecting in 5s\", flush=True)\n        time.sleep(5)\n\nif
-    __name__ == \"__main__\":\n    main()\n"
+    True},\n        {\"name\": \"Source IP\", \"value\": f\"`{d.get('sourceIPAddress',
+    '?')}`\", \"inline\": True},\n    ]\n\n    params = d.get(\"requestParameters\")\n
+    \   if params:\n        params_str = _truncate(json.dumps(params), 1000)\n        fields.append({\"name\":
+    \"Parameters\", \"value\": f\"```json\\n{params_str}\\n```\", \"inline\": False})\n\n
+    \   fields.append({\"name\": \"User-Agent\", \"value\": f\"```{ua}```\", \"inline\":
+    False})\n\n    return {\n        \"title\": title,\n        \"color\": severity_color(action),\n
+    \       \"fields\": fields,\n        \"footer\": {\"text\": \"floci-deception\"},\n
+    \       \"timestamp\": d.get(\"eventTime\"),\n    }\n\n\ndef post_discord(payload:
+    dict):\n    for attempt in range(3):\n        try:\n            r = requests.post(DISCORD_WEBHOOK,
+    json=payload, timeout=10)\n            if r.status_code == 429:\n                wait
+    = r.json().get(\"retry_after\", 1)\n                time.sleep(wait)\n                continue\n
+    \           print(f\"posted to discord: status={r.status_code}\", flush=True)\n
+    \           return\n        except Exception as e:\n            print(f\"discord
+    post failed (attempt {attempt + 1}/3): {e}\", flush=True)\n            time.sleep(2
+    ** attempt)\n    print(\"discord post dropped after 3 attempts\", flush=True)\n\n\n_seen_ids
+    = set()\n_seen_order = deque()\n\n\ndef already_seen(event_id: str) -> bool:\n
+    \   if not event_id:\n        return False\n    if event_id in _seen_ids:\n        return
+    True\n    _seen_ids.add(event_id)\n    _seen_order.append(event_id)\n    if len(_seen_order)
+    > SEEN_MAX:\n        old = _seen_order.popleft()\n        _seen_ids.discard(old)\n
+    \   return False\n\n\ndef handle_line(line: str):\n    \"\"\"One log line in,
+    zero or one Discord post out. Shared by both\n    tailers so a malformed line
+    or a duplicate event is handled\n    identically regardless of transport.\"\"\"\n
+    \   try:\n        event = json.loads(line)\n    except Exception:\n        post_discord({\"content\":
+    f\"cloudtrail activity (unparsed): {line[:200]}\"})\n        return\n    if already_seen(event.get(\"requestID\")):\n
+    \       return\n    post_discord({\"embeds\": [format_embed(event)]})\n"
+  tailer.py: |
+    #!/usr/bin/env python3
+    """
+    Tails Loki's real-time WebSocket API for {log_type="cloudtrail"} and
+    hands each line to shared/discord_alerting.py. Formatting, retries,
+    and the dedup guard all live there -- this file is only "how events
+    arrive" for the Kubernetes deployment specifically. Compose's tailer
+    (shared/file-tailer.py) tails the local log file directly instead,
+    since Compose doesn't assume a Loki is available.
+    """
+    import json
+    import time
+    import urllib.parse
+
+    import websocket
+
+    import discord_alerting
+
+    LOKI_WS = (
+        "ws://loki.loki.svc.cluster.local:3100/loki/api/v1/tail?query="
+        + urllib.parse.quote('{log_type="cloudtrail"}')
+    )
+
+
+    def on_message(ws, message):
+        data = json.loads(message)
+        for stream in data.get("streams", []):
+            for _ts, line in stream.get("values", []):
+                discord_alerting.handle_line(line)
+
+
+    def on_error(ws, error):
+        print(f"ws error: {error}", flush=True)
+
+
+    def on_close(ws, *_a):
+        print("ws closed", flush=True)
+
+
+    def on_open(ws):
+        print(f"ws connected: {LOKI_WS}", flush=True)
+
+
+    def main():
+        while True:
+            ws = websocket.WebSocketApp(
+                LOKI_WS,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            ws.run_forever()
+            print("reconnecting in 5s", flush=True)
+            time.sleep(5)
+
+
+    if __name__ == "__main__":
+        main()
 kind: ConfigMap
 metadata:
   name: discord-alert-tailer-script

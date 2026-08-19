@@ -27,6 +27,8 @@ spec:
                 secretKeyRef:
                   name: discord-webhook
                   key: url
+            - name: HONEYPOT_URL
+              value: "https://ml-compute-01.tail6c68d0.ts.net/"
           volumeMounts:
             - name: script
               mountPath: /app

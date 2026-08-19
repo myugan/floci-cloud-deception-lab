@@ -56,6 +56,37 @@ irreversible-termination rule) — that's floci's own behavior, not something
 this fixes. `describe-instances` still shows full realistic detail instead
 of an empty list; it just won't read as a currently-running fleet.
 
+## Discord alerts
+
+Same real-time, per-event alerting as the Kubernetes deployment, sharing
+the exact same formatting/severity-coloring/retry/dedup logic via
+`../shared/discord_alerting.py`. Only "where events come from" differs:
+the Kubernetes tailer watches Loki's live websocket, this one tails the
+local CloudTrail-shaped log file directly (`shared/file-tailer.py`) since
+Compose doesn't assume a Loki is running anywhere.
+
+Off by default. Set up and enable:
+
+```sh
+cp .env.example .env
+# edit .env: DISCORD_WEBHOOK_URL and HONEYPOT_URL (your droplet's real
+# public URL, not localhost -- honeypot-liveness checks the same public
+# path a real attacker would use)
+docker compose --profile alerting up -d
+```
+
+`honeypot-liveness` checks that URL every 60s and alerts after two
+consecutive failures (a Running container proves nothing about whether an
+attacker can actually reach the thing — a dropped tunnel or DNS lag leaves
+every container healthy while the honeypot is invisible from outside).
+
+Neither of these two run on the shared, intercepted network namespace like
+everything else in this file — they need real, unintercepted internet
+access to reach Discord's API and to check the public URL. Sharing the
+intercepted namespace would get their own traffic MITM'd by the fake
+`*.amazonaws.com` cert, the same bug `floci-seed`'s `pip install` hit
+before it got moved off that namespace too.
+
 ## One gotcha if you ever touch `docker-compose.yml`
 
 `envoy` sets `ENVOY_UID: "0"`. The official image's own entrypoint drops
@@ -91,6 +122,7 @@ env var or "fix" it by loosening the key file's permissions instead.
 compose/
 ├── docker-compose.yml
 ├── promtail.yaml            -- edit the client URL before enabling --profile logging
+├── .env.example             -- copy to .env before enabling --profile alerting
 ├── scripts/
 │   ├── generate-tls-secrets.sh
 │   └── generate-canary-secret.sh

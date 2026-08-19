@@ -1,13 +1,76 @@
 apiVersion: v1
 data:
+  discord_alerting.py: "\"\"\"\nShared core for posting CloudTrail-shaped events to
+    Discord as they\nhappen -- one embed per event, no batching, no polling delay,
+    no\nfiring/resolved lifecycle. Orchestrator-agnostic: this is the part\nthat's
+    identical regardless of where the events come from.\n\nTwo different tailers import
+    this:\n  - manifests/alerting/tailer.py tails Loki's live websocket API.\n  -
+    compose's tailer (shared/file-tailer.py) tails the local log file\n    directly,
+    since Compose doesn't assume a Loki is available.\nOnly \"how events arrive\"
+    differs between them; formatting, severity\ncoloring, retry-on-failure, and the
+    dedup guard all live here once.\n\nSeverity coloring is purely a display concern
+    here, not a log label\n(kept out of the log data model per earlier feedback) —
+    picks an\nembed color from the action name so a busy channel is scannable at a\nglance.\n\nDedup
+    guard: Envoy's Lua callback can fire more than once for the\nsame logical request,
+    producing repeated identical eventIDs in the\nlog. A small recently-seen set drops
+    repeats so one client call never\nposts as multiple identical embeds.\n\"\"\"\nimport
+    json\nimport os\nimport re\nimport time\nfrom collections import deque\n\nimport
+    requests\n\nDISCORD_WEBHOOK = os.environ[\"DISCORD_WEBHOOK_URL\"]\n\nSEEN_MAX
+    = 500\n\nCOLOR_CRITICAL = 0xE74C3C  # red    — privesc / persistence / destructive\nCOLOR_WARNING
+    = 0xE67E22   # orange — general mutating calls\nCOLOR_INFO = 0x95A5A6      # grey
+    \  — recon / read-only, routine noise\n\n# Purely for choosing a color — no labels,
+    no Loki, nothing upstream.\n_CRITICAL_RE = re.compile(\n    r\"^(Attach.*Policy|Put.*Policy|Detach.*Policy|.*PolicyVersion|AssumeRole.*|\"\n
+    \   r\"CreateLoginProfile|UpdateLoginProfile|AddUserToGroup|UpdateAssumeRolePolicy|\"\n
+    \   r\"CreateAccessKey|UpdateAccessKey|Delete.*|Terminate.*|Revoke.*)$\"\n)\n_INFO_RE
+    = re.compile(r\"^(Get.*|List.*|Describe.*|Lookup.*)$\")\n\n\ndef severity_color(event_name:
+    str) -> int:\n    if _CRITICAL_RE.match(event_name):\n        return COLOR_CRITICAL\n
+    \   if _INFO_RE.match(event_name):\n        return COLOR_INFO\n    return COLOR_WARNING\n\n\ndef
+    _truncate(s: str, limit: int) -> str:\n    return s if len(s) <= limit else s[:
+    limit - 1] + \"…\"\n\n\ndef format_embed(d: dict) -> dict:\n    ua = d.get(\"userAgent\",
+    \"?\")\n    if len(ua) > 200:\n        ua = ua[:200] + \"…\"\n\n    action = d.get(\"eventName\",
+    \"?\")\n    title = \"\U0001F6A8 Canary key triggered\"\n\n    fields = [\n        {\"name\":
+    \"Service\", \"value\": f\"`{d.get('eventSource', '?')}`\", \"inline\": True},\n
+    \       {\"name\": \"Action\", \"value\": f\"**{action}**\", \"inline\": True},\n
+    \       {\"name\": \"Region\", \"value\": f\"`{d.get('awsRegion', '?')}`\", \"inline\":
+    True},\n        {\"name\": \"Source IP\", \"value\": f\"`{d.get('sourceIPAddress',
+    '?')}`\", \"inline\": True},\n    ]\n\n    params = d.get(\"requestParameters\")\n
+    \   if params:\n        params_str = _truncate(json.dumps(params), 1000)\n        fields.append({\"name\":
+    \"Parameters\", \"value\": f\"```json\\n{params_str}\\n```\", \"inline\": False})\n\n
+    \   fields.append({\"name\": \"User-Agent\", \"value\": f\"```{ua}```\", \"inline\":
+    False})\n\n    return {\n        \"title\": title,\n        \"color\": severity_color(action),\n
+    \       \"fields\": fields,\n        \"footer\": {\"text\": \"floci-deception\"},\n
+    \       \"timestamp\": d.get(\"eventTime\"),\n    }\n\n\ndef post_discord(payload:
+    dict):\n    for attempt in range(3):\n        try:\n            r = requests.post(DISCORD_WEBHOOK,
+    json=payload, timeout=10)\n            if r.status_code == 429:\n                wait
+    = r.json().get(\"retry_after\", 1)\n                time.sleep(wait)\n                continue\n
+    \           print(f\"posted to discord: status={r.status_code}\", flush=True)\n
+    \           return\n        except Exception as e:\n            print(f\"discord
+    post failed (attempt {attempt + 1}/3): {e}\", flush=True)\n            time.sleep(2
+    ** attempt)\n    print(\"discord post dropped after 3 attempts\", flush=True)\n\n\n_seen_ids
+    = set()\n_seen_order = deque()\n\n\ndef already_seen(event_id: str) -> bool:\n
+    \   if not event_id:\n        return False\n    if event_id in _seen_ids:\n        return
+    True\n    _seen_ids.add(event_id)\n    _seen_order.append(event_id)\n    if len(_seen_order)
+    > SEEN_MAX:\n        old = _seen_order.popleft()\n        _seen_ids.discard(old)\n
+    \   return False\n\n\ndef handle_line(line: str):\n    \"\"\"One log line in,
+    zero or one Discord post out. Shared by both\n    tailers so a malformed line
+    or a duplicate event is handled\n    identically regardless of transport.\"\"\"\n
+    \   try:\n        event = json.loads(line)\n    except Exception:\n        post_discord({\"content\":
+    f\"cloudtrail activity (unparsed): {line[:200]}\"})\n        return\n    if already_seen(event.get(\"requestID\")):\n
+    \       return\n    post_discord({\"embeds\": [format_embed(event)]})\n"
   liveness-check.py: |
     #!/usr/bin/env python3
     """
-    Checks the honeypot's public Funnel URL on a timer and posts to Discord
-    when it goes down or comes back. A Running pod doesn't prove the thing
-    an attacker would actually hit still works -- Funnel can drop, DNS can
-    lag, the pod can be mid-restart. This checks the same public path a
-    real attacker would use, not the cluster's internal view of itself.
+    Checks the honeypot's public URL on a timer and posts to Discord when
+    it goes down or comes back. A Running pod/container doesn't prove the
+    thing an attacker would actually hit still works -- a public tunnel
+    can drop, DNS can lag, the workload can be mid-restart. This checks
+    the same public path a real attacker would use, not the deployment's
+    internal view of itself.
+
+    Orchestrator-agnostic: HONEYPOT_URL is required, not hardcoded, since
+    it's inherently different per deployment (a Tailscale Funnel hostname
+    for the Kubernetes deployment, a droplet's own IP or domain for
+    Compose).
 
     Two consecutive failures before alerting, not one -- a single blip
     isn't worth a page.
@@ -16,8 +79,9 @@ data:
     import time
     import requests
 
-    URL = "https://ml-compute-01.tail6c68d0.ts.net/"
-    DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
+    from discord_alerting import post_discord
+
+    URL = os.environ["HONEYPOT_URL"]
     CHECK_INTERVAL_SECONDS = 60
     FAILURES_BEFORE_ALERT = 2
 
@@ -33,18 +97,6 @@ data:
             return False, f"status={r.status_code}, unexpected body"
         except Exception as e:
             return False, str(e)[:200]
-
-
-    def post_discord(payload: dict):
-        for attempt in range(3):
-            try:
-                r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-                print(f"posted to discord: status={r.status_code}", flush=True)
-                return
-            except Exception as e:
-                print(f"discord post failed (attempt {attempt + 1}/3): {e}", flush=True)
-                time.sleep(2 ** attempt)
-        print("discord post dropped after 3 attempts", flush=True)
 
 
     def main():

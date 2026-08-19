@@ -30,6 +30,7 @@
 services:
   netns:
     image: alpine:3.20
+    restart: unless-stopped
     command: ["sleep", "infinity"]
     ports:
       - "443:8443"   # aws_intercept (TLS) -- the AWS-bound traffic path
@@ -49,6 +50,7 @@ services:
 
   envoy:
     image: envoyproxy/envoy:v1.31-latest
+    restart: unless-stopped
     network_mode: "service:netns"
     depends_on:
       netinit:
@@ -71,6 +73,7 @@ services:
 
   ml-worker:
     image: rayproject/ray:2.9.0-py311
+    restart: unless-stopped
     network_mode: "service:netns"
     depends_on:
       netinit:
@@ -91,6 +94,7 @@ services:
 
   floci:
     image: floci/floci:latest
+    restart: unless-stopped
     network_mode: "service:netns"
     depends_on:
       netinit:
@@ -123,6 +127,7 @@ services:
   # enabling.
   promtail:
     image: grafana/promtail:latest
+    restart: unless-stopped
     profiles: ["logging"]
     network_mode: "service:netns"
     depends_on:
@@ -132,6 +137,44 @@ services:
       - ./promtail.yaml:/etc/promtail/promtail.yaml:ro
       - ct-logs:/var/log/floci-ct:ro
     command: ["-config.file=/etc/promtail/promtail.yaml"]
+
+  # Off by default -- `docker compose --profile alerting up` to
+  # include both of these, after setting DISCORD_WEBHOOK_URL and
+  # HONEYPOT_URL in .env (see .env.example). Deliberately NOT on
+  # network_mode: service:netns like everything above -- they need
+  # real, unintercepted internet access to actually reach Discord's API
+  # and to check the honeypot's public URL the way a real attacker
+  # would, and sharing the intercepted namespace would get their own
+  # traffic MITM'd by the fake *.amazonaws.com cert (hit this exact
+  # bug with floci-seed's pip install before moving it off netns too).
+  # ct-logs is a plain Docker volume, unrelated to network namespaces,
+  # so mounting it here works fine without needing that shared netns.
+  discord-alert-tailer:
+    image: python:3.12-slim
+    restart: unless-stopped
+    profiles: ["alerting"]
+    depends_on:
+      envoy:
+        condition: service_started
+    environment:
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:?set DISCORD_WEBHOOK_URL in .env}
+    volumes:
+      - ../shared/file-tailer.py:/app/file-tailer.py:ro
+      - ../shared/discord_alerting.py:/app/discord_alerting.py:ro
+      - ct-logs:/var/log/floci-ct:ro
+    command: ["/bin/sh", "-c", "pip install --no-cache-dir --quiet requests && exec python /app/file-tailer.py"]
+
+  honeypot-liveness:
+    image: python:3.12-slim
+    restart: unless-stopped
+    profiles: ["alerting"]
+    environment:
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:?set DISCORD_WEBHOOK_URL in .env}
+      HONEYPOT_URL: ${HONEYPOT_URL:?set HONEYPOT_URL in .env -- your droplet's public URL}
+    volumes:
+      - ../shared/liveness-check.py:/app/liveness-check.py:ro
+      - ../shared/discord_alerting.py:/app/discord_alerting.py:ro
+    command: ["/bin/sh", "-c", "pip install --no-cache-dir --quiet requests && exec python /app/liveness-check.py"]
 
 volumes:
   ct-logs: {}
