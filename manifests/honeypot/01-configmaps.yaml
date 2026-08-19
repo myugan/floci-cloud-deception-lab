@@ -32,8 +32,16 @@ data:
                   typed_config:
                     "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                     stat_prefix: aws_intercept
+                    # Connection: close avoids a keep-alive framing bug
+                    # seen here (Lua's body() + reused plain-HTTP
+                    # connection eventually corrupts into duplicate/
+                    # malformed requests, since floci's upstream leg is
+                    # plain HTTP even though the client leg is TLS) --
+                    # same fix already applied on direct_floci_intercept.
                     route_config:
                       name: local_route
+                      response_headers_to_add:
+                        - header: { key: "Connection", value: "close" }
                       virtual_hosts:
                         - name: floci
                           domains: ["*"]
@@ -537,13 +545,30 @@ data:
           connect_timeout: 2s
           type: STATIC
           lb_policy: ROUND_ROBIN
+          # Safety net, not the fix itself (see the 127.0.0.2 comment
+          # below for the actual root cause -- a redirect self-loop).
+          # Keeps the default max_connections::1024 from ever letting a
+          # future misbehaving client (or a real attacker's own tooling)
+          # spawn an unbounded storm of parallel connections against
+          # floci again.
+          circuit_breakers:
+            thresholds:
+              - priority: DEFAULT
+                max_connections: 50
+                max_pending_requests: 50
+                max_requests: 50
           load_assignment:
             cluster_name: floci
             endpoints:
               - lb_endpoints:
                   - endpoint:
+                      # 127.0.0.2, not .1: floci itself binds 0.0.0.0 so
+                      # this reaches it fine, but the iptables redirect
+                      # rule is scoped to -d 127.0.0.1 specifically --
+                      # dialing .2 here means this connection can never
+                      # match that rule and loop back into envoy itself.
                       address:
-                        socket_address: { address: 127.0.0.1, port_value: 4566 }
+                        socket_address: { address: 127.0.0.2, port_value: 4566 }
     admin:
       address:
         socket_address: { address: 127.0.0.1, port_value: 9901 }
@@ -688,9 +713,16 @@ data:
     # No owner-uid exclusion needed here: envoy never dials out for real
     # (its only cluster is floci on loopback), so there's no loop to avoid.
     iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-port 8443
-    # Catches direct :4566 calls too. Envoy (uid 0) excluded so its
-    # own forwarding to floci doesn't loop.
-    iptables -t nat -A OUTPUT -p tcp --dport 4566 -m owner --uid-owner 0 -j RETURN
-    iptables -t nat -A OUTPUT -p tcp --dport 4566 -j REDIRECT --to-port 8080
+    # Catches direct :4566 calls too. Scoped to -d 127.0.0.1 specifically
+    # (not 0.0.0.0/0) so envoy's own forwarding to floci -- which dials
+    # 127.0.0.2:4566, a second loopback address outside this rule's
+    # match -- can't loop back into itself. An earlier uid-owner-based
+    # exclusion for this looked correct on paper but the OUTPUT chain's
+    # owner match didn't reliably attribute envoy's own outbound socket
+    # to uid 0 in practice (confirmed via iptables counters: the RETURN
+    # rule matched 0 packets while envoy's own dial still hit REDIRECT),
+    # causing a self-amplifying request storm. IP-scoping needs no
+    # owner-matching at all, so it can't have that failure mode.
+    iptables -t nat -A OUTPUT -p tcp -d 127.0.0.1 --dport 4566 -j REDIRECT --to-port 8080
     echo "honeypot iptables rules installed"
     iptables -t nat -L OUTPUT -n --line-numbers
