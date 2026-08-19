@@ -28,13 +28,15 @@ data:
     _truncate(s: str, limit: int) -> str:\n    return s if len(s) <= limit else s[:
     limit - 1] + \"…\"\n\n\ndef format_embed(d: dict) -> dict:\n    ua = d.get(\"userAgent\",
     \"?\")\n    if len(ua) > 200:\n        ua = ua[:200] + \"…\"\n\n    action = d.get(\"eventName\",
-    \"?\")\n    title = \"\U0001F6A8 Canary key triggered\"\n\n    fields = [\n        {\"name\":
-    \"Service\", \"value\": f\"`{d.get('eventSource', '?')}`\", \"inline\": True},\n
-    \       {\"name\": \"Action\", \"value\": f\"**{action}**\", \"inline\": True},\n
-    \       {\"name\": \"Region\", \"value\": f\"`{d.get('awsRegion', '?')}`\", \"inline\":
-    True},\n        {\"name\": \"Source IP\", \"value\": f\"`{d.get('sourceIPAddress',
-    '?')}`\", \"inline\": True},\n    ]\n\n    params = d.get(\"requestParameters\")\n
-    \   if params:\n        params_str = _truncate(json.dumps(params), 1000)\n        fields.append({\"name\":
+    \"?\")\n    title = \"\U0001F6A8 Canary key triggered\"\n\n    # sourceIPAddress
+    comes through as ip:port; the port's meaningless\n    # here (always some ephemeral
+    local port), just show the address.\n    src_ip = d.get(\"sourceIPAddress\", \"?\").rsplit(\":\",
+    1)[0]\n\n    fields = [\n        {\"name\": \"Service\", \"value\": f\"`{d.get('eventSource',
+    '?')}`\", \"inline\": True},\n        {\"name\": \"Action\", \"value\": f\"**{action}**\",
+    \"inline\": True},\n        {\"name\": \"Region\", \"value\": f\"`{d.get('awsRegion',
+    '?')}`\", \"inline\": True},\n        {\"name\": \"Source IP\", \"value\": f\"`{src_ip}`\",
+    \"inline\": True},\n    ]\n\n    params = d.get(\"requestParameters\")\n    if
+    params:\n        params_str = _truncate(json.dumps(params), 1000)\n        fields.append({\"name\":
     \"Parameters\", \"value\": f\"```json\\n{params_str}\\n```\", \"inline\": False})\n\n
     \   fields.append({\"name\": \"User-Agent\", \"value\": f\"```{ua}```\", \"inline\":
     False})\n\n    return {\n        \"title\": title,\n        \"color\": severity_color(action),\n

@@ -164,6 +164,17 @@ spec:
         - name: envoy-sidecar
           image: envoyproxy/envoy:v1.31-latest
           args: ["-c", "/etc/envoy/envoy.yaml"]
+          env:
+            # The image's own entrypoint drops privileges to a non-root
+            # "envoy" user (uid 101) by default -- confirmed this has
+            # been true here the whole time (checked /proc/1/status,
+            # not a fresh kubectl exec, which defaults differently). It
+            # never crashed only because Secret-mounted files default
+            # to world-readable, unlike Compose's bind-mounted 0600
+            # key, which hit this for real and needed the same fix.
+            # Explicit here now instead of silently depending on that.
+            - name: ENVOY_UID
+              value: "0"
           # The IMDS listener's Lua filter hands these back as the fake
           # role's credentials — same canary key, one more path to find it.
           envFrom:
