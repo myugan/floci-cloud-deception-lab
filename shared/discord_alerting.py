@@ -135,11 +135,19 @@ def already_seen(event_id: str) -> bool:
 def handle_line(line: str):
     """One log line in, zero or one Discord post out. Shared by both
     tailers so a malformed line or a duplicate event is handled
-    identically regardless of transport."""
+    identically regardless of transport.
+
+    A malformed line means Envoy logged a connection where its own
+    Lua filter never finished (TLS-only probes, truncated requests,
+    scanners that connect and drop) -- x-ct-event-rest comes back as
+    a literal "-", which isn't valid JSON. That's background internet
+    scan noise on an exposed :443, not an attacker action worth a
+    Discord ping -- print it to stdout (still visible in
+    docker/kubectl logs) instead of paging."""
     try:
         event = json.loads(line)
     except Exception:
-        post_discord({"content": f"cloudtrail activity (unparsed): {line[:200]}"})
+        print(f"cloudtrail activity (unparsed, not alerted): {line[:200]}", flush=True)
         return
     if already_seen(event.get("requestID")):
         return

@@ -15,11 +15,16 @@ data:
     producing repeated identical eventIDs in the\nlog. A small recently-seen set drops
     repeats so one client call never\nposts as multiple identical embeds.\n\"\"\"\nimport
     json\nimport os\nimport re\nimport time\nfrom collections import deque\n\nimport
-    requests\n\nDISCORD_WEBHOOK = os.environ[\"DISCORD_WEBHOOK_URL\"]\n\nSEEN_MAX
-    = 500\n\nCOLOR_CRITICAL = 0xE74C3C  # red    — privesc / persistence / destructive\nCOLOR_WARNING
-    = 0xE67E22   # orange — general mutating calls\nCOLOR_INFO = 0x95A5A6      # grey
-    \  — recon / read-only, routine noise\n\n# Purely for choosing a color — no labels,
-    no Loki, nothing upstream.\n_CRITICAL_RE = re.compile(\n    r\"^(Attach.*Policy|Put.*Policy|Detach.*Policy|.*PolicyVersion|AssumeRole.*|\"\n
+    requests\n\nDISCORD_WEBHOOK = os.environ[\"DISCORD_WEBHOOK_URL\"]\nif not DISCORD_WEBHOOK:\n
+    \   # Kubernetes leaves this genuinely unset if misconfigured (a clear\n    #
+    KeyError above). Compose's optional profile passes it through as\n    # an empty
+    string when .env isn't set, which would otherwise fail\n    # opaquely inside
+    requests.post() instead of here.\n    raise RuntimeError(\"DISCORD_WEBHOOK_URL
+    is empty -- set it in .env\")\n\nSEEN_MAX = 500\n\nCOLOR_CRITICAL = 0xE74C3C  #
+    red    — privesc / persistence / destructive\nCOLOR_WARNING = 0xE67E22   # orange
+    — general mutating calls\nCOLOR_INFO = 0x95A5A6      # grey   — recon / read-only,
+    routine noise\n\n# Purely for choosing a color — no labels, no Loki, nothing upstream.\n_CRITICAL_RE
+    = re.compile(\n    r\"^(Attach.*Policy|Put.*Policy|Detach.*Policy|.*PolicyVersion|AssumeRole.*|\"\n
     \   r\"CreateLoginProfile|UpdateLoginProfile|AddUserToGroup|UpdateAssumeRolePolicy|\"\n
     \   r\"CreateAccessKey|UpdateAccessKey|Delete.*|Terminate.*|Revoke.*)$\"\n)\n_INFO_RE
     = re.compile(r\"^(Get.*|List.*|Describe.*|Lookup.*)$\")\n\n\ndef severity_color(event_name:
@@ -55,9 +60,15 @@ data:
     > SEEN_MAX:\n        old = _seen_order.popleft()\n        _seen_ids.discard(old)\n
     \   return False\n\n\ndef handle_line(line: str):\n    \"\"\"One log line in,
     zero or one Discord post out. Shared by both\n    tailers so a malformed line
-    or a duplicate event is handled\n    identically regardless of transport.\"\"\"\n
-    \   try:\n        event = json.loads(line)\n    except Exception:\n        post_discord({\"content\":
-    f\"cloudtrail activity (unparsed): {line[:200]}\"})\n        return\n    if already_seen(event.get(\"requestID\")):\n
+    or a duplicate event is handled\n    identically regardless of transport.\n\n
+    \   A malformed line means Envoy logged a connection where its own\n    Lua filter
+    never finished (TLS-only probes, truncated requests,\n    scanners that connect
+    and drop) -- x-ct-event-rest comes back as\n    a literal \"-\", which isn't valid
+    JSON. That's background internet\n    scan noise on an exposed :443, not an attacker
+    action worth a\n    Discord ping -- print it to stdout (still visible in\n    docker/kubectl
+    logs) instead of paging.\"\"\"\n    try:\n        event = json.loads(line)\n    except
+    Exception:\n        print(f\"cloudtrail activity (unparsed, not alerted): {line[:200]}\",
+    flush=True)\n        return\n    if already_seen(event.get(\"requestID\")):\n
     \       return\n    post_discord({\"embeds\": [format_embed(event)]})\n"
   liveness-check.py: |
     #!/usr/bin/env python3
@@ -84,6 +95,10 @@ data:
     from discord_alerting import post_discord
 
     URL = os.environ["HONEYPOT_URL"]
+    if not URL:
+        # Compose's optional alerting profile passes this through as an
+        # empty string when .env isn't set, rather than leaving it unset.
+        raise RuntimeError("HONEYPOT_URL is empty -- set it in .env")
     CHECK_INTERVAL_SECONDS = 60
     FAILURES_BEFORE_ALERT = 2
 
