@@ -46,6 +46,14 @@ for r in regions:
     sans.append(f"DNS:*.s3.{r}.amazonaws.com")
     sans.append(f"DNS:*.s3.dualstack.{r}.amazonaws.com")
     sans.append(f"DNS:*.s3-fips.{r}.amazonaws.com")
+    # A single-label wildcard can't cover these -- confirmed against
+    # real botocore endpoint resolution (client.meta.endpoint_url) for
+    # every service floci supports. Everything else floci supports
+    # resolves to a single label before <region>.amazonaws.com and is
+    # already covered by the wildcard above.
+    sans.append(f"DNS:api.ecr.{r}.amazonaws.com")
+    sans.append(f"DNS:api.pricing.{r}.amazonaws.com")
+    sans.append(f"DNS:data-ats.iot.{r}.amazonaws.com")
 print("subjectAltName = " + ", ".join(sans))
 PYEOF
 

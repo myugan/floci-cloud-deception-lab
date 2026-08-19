@@ -569,9 +569,16 @@ data:
                       # match that rule and loop back into envoy itself.
                       address:
                         socket_address: { address: 127.0.0.2, port_value: 4566 }
+    # Unix socket, not TCP: a TCP admin port on 127.0.0.1 is reachable
+    # from every container in the pod (they share the network
+    # namespace) -- ml-worker could query /clusters, /stats,
+    # /config_dump and learn the interception topology, including the
+    # 127.0.0.2 address above. A socket file lives in envoy-sidecar's
+    # own filesystem, which mount namespaces keep private per
+    # container even though the network namespace is shared.
     admin:
       address:
-        socket_address: { address: 127.0.0.1, port_value: 9901 }
+        pipe: { path: /tmp/envoy-admin.sock }
 
 ---
 apiVersion: v1
