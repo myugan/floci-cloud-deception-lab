@@ -18,7 +18,6 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: aws_intercept
                 server_header_transformation: PASS_THROUGH
-                suppress_envoy_headers: true
                 route_config:
                   name: local_route
                   response_headers_to_add:
@@ -310,6 +309,7 @@ static_resources:
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: true
                 access_log: &shared_access_log
                   - name: envoy.access_loggers.stdout
                     filter:
@@ -344,7 +344,6 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: direct_floci_intercept
                 server_header_transformation: PASS_THROUGH
-                suppress_envoy_headers: true
                 route_config:
                   name: local_route
                   response_headers_to_add:
@@ -367,7 +366,6 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: imds_intercept
                 server_header_transformation: PASS_THROUGH
-                suppress_envoy_headers: true
                 route_config:
                   name: local_route
                   virtual_hosts:
@@ -483,6 +481,7 @@ static_resources:
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: true
                 access_log: *shared_access_log
   clusters:
     - name: floci
